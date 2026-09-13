@@ -1,0 +1,556 @@
+use macroquad::prelude::*;
+use std::collections::HashSet;
+
+const WORLD_W: f32 = 2600.0;
+const WORLD_H: f32 = 1560.0;
+const WALL: f32 = 48.0;
+const LINE_X: f32 = 1050.0;
+const SPAWN: Vec2 = vec2(560.0, 245.0);
+
+const COLOR_NAMES: [&str; 13] = [
+    "White", "Brown", "Mint", "Sky", "Rose", "Lemon", "Lava", "Ocean", "Violet", "Slime",
+    "Midnight", "Golden", "Rainbow",
+];
+const PATTERN_NAMES: [&str; 13] = [
+    "Plain", "Spotted", "Striped", "Starry", "Cracked", "Swirly", "Checker", "Glossy", "Fuzzy",
+    "Crystal", "Camo", "Royal", "Hacker",
+];
+const EGG_COLORS: [Color; 13] = [
+    Color::new(0.96, 0.96, 0.92, 1.0),
+    Color::new(0.72, 0.52, 0.34, 1.0),
+    Color::new(0.62, 0.93, 0.75, 1.0),
+    Color::new(0.55, 0.80, 0.98, 1.0),
+    Color::new(0.98, 0.66, 0.76, 1.0),
+    Color::new(0.99, 0.95, 0.55, 1.0),
+    Color::new(0.95, 0.42, 0.22, 1.0),
+    Color::new(0.15, 0.45, 0.75, 1.0),
+    Color::new(0.65, 0.45, 0.90, 1.0),
+    Color::new(0.55, 0.85, 0.25, 1.0),
+    Color::new(0.24, 0.24, 0.42, 1.0),
+    Color::new(1.00, 0.82, 0.20, 1.0),
+    Color::new(0.95, 0.35, 0.85, 1.0),
+];
+
+const T_NAMES: [&str; 7] = ["Dirt", "Copper", "Iron", "Gold", "Diamond", "Pro", "Hacker"];
+const T_COSTS: [f64; 7] = [0.0, 100.0, 400.0, 1500.0, 6000.0, 25000.0, 100000.0];
+const T_MULT: [f32; 7] = [1.0, 2.0, 4.0, 8.0, 16.0, 40.0, 150.0];
+const T_COLORS: [Color; 7] = [
+    Color::new(0.45, 0.32, 0.18, 1.0),
+    Color::new(0.80, 0.45, 0.20, 1.0),
+    Color::new(0.62, 0.64, 0.68, 1.0),
+    Color::new(0.95, 0.78, 0.15, 1.0),
+    Color::new(0.45, 0.90, 0.95, 1.0),
+    Color::new(0.60, 0.25, 0.90, 1.0),
+    Color::new(0.10, 0.90, 0.30, 1.0),
+];
+
+struct Egg {
+    pos: Vec2,
+    kind: usize,
+    phase: f32,
+}
+
+struct Monster {
+    pos: Vec2,
+    home: Vec2,
+    r: f32,
+    color: Color,
+    awake: f32,
+}
+
+fn rng(a: f32, b: f32) -> f32 {
+    macroquad::rand::gen_range(a, b)
+}
+
+fn egg_value(kind: usize) -> f64 {
+    ((kind / 13 + 1) * (kind % 13 + 1)) as f64
+}
+
+fn egg_name(kind: usize) -> String {
+    format!("{} {} Egg", PATTERN_NAMES[kind % 13], COLOR_NAMES[kind / 13])
+}
+
+fn rarity(kind: usize) -> (&'static str, Color) {
+    let v = egg_value(kind);
+    if v < 10.0 {
+        ("Common", LIGHTGRAY)
+    } else if v < 30.0 {
+        ("Uncommon", GREEN)
+    } else if v < 60.0 {
+        ("Rare", SKYBLUE)
+    } else if v < 100.0 {
+        ("Epic", VIOLET)
+    } else if v < 150.0 {
+        ("Legendary", ORANGE)
+    } else {
+        ("MYTHIC", RED)
+    }
+}
+
+fn random_kind() -> usize {
+    let r = rng(0.0, 1.0);
+    ((r * r * r) * 168.9) as usize
+}
+
+fn random_egg_pos() -> Vec2 {
+    vec2(
+        rng(LINE_X + 140.0, WORLD_W - WALL - 90.0),
+        rng(WALL + 90.0, WORLD_H - WALL - 90.0),
+    )
+}
+
+fn darker(c: Color, f: f32) -> Color {
+    Color::new(c.r * f, c.g * f, c.b * f, c.a)
+}
+
+fn draw_egg(x: f32, y: f32, kind: usize, s: f32) {
+    let c = EGG_COLORS[kind / 13];
+    let d = darker(c, 0.55);
+    let rx = 13.0 * s;
+    let ry = 17.0 * s;
+    draw_ellipse(x, y, rx, ry, 0.0, c);
+    match kind % 13 {
+        1 => {
+            for (dx, dy) in [(-4.0, -5.0), (5.0, 2.0), (-2.0, 7.0)] {
+                draw_circle(x + dx * s, y + dy * s, 2.6 * s, d);
+            }
+        }
+        2 => {
+            for dy in [-6.0f32, 0.0, 6.0] {
+                draw_line(x - rx * 0.7, y + dy * s, x + rx * 0.7, y + dy * s, 2.2 * s, d);
+            }
+        }
+        3 => {
+            for (dx, dy) in [(-4.0, -4.0), (4.0, 4.0)] {
+                draw_poly(x + dx * s, y + dy * s, 5, 3.2 * s, 0.0, Color::new(1.0, 0.95, 0.4, 1.0));
+            }
+        }
+        4 => {
+            draw_line(x - 4.0 * s, y - 9.0 * s, x + 2.0 * s, y - 1.0 * s, 1.8 * s, d);
+            draw_line(x + 2.0 * s, y - 1.0 * s, x - 3.0 * s, y + 7.0 * s, 1.8 * s, d);
+        }
+        5 => {
+            draw_circle_lines(x, y, 6.0 * s, 2.0 * s, d);
+        }
+        6 => {
+            for (dx, dy) in [(-6.0, -7.0), (0.0, -7.0), (-3.0, -1.0), (3.0, -1.0), (-6.0, 5.0), (0.0, 5.0)] {
+                draw_rectangle(x + dx * s, y + dy * s, 3.5 * s, 3.5 * s, d);
+            }
+        }
+        7 => {
+            draw_circle(x - 4.0 * s, y - 6.0 * s, 3.2 * s, Color::new(1.0, 1.0, 1.0, 0.85));
+        }
+        8 => {
+            draw_circle_lines(x, y, ry * 0.85, 2.5 * s, Color::new(c.r, c.g, c.b, 0.5));
+        }
+        9 => {
+            draw_poly(x, y, 3, 6.5 * s, -90.0, Color::new(0.88, 0.97, 1.0, 0.9));
+        }
+        10 => {
+            draw_circle(x - 4.0 * s, y - 3.0 * s, 4.0 * s, Color::new(0.35, 0.45, 0.25, 1.0));
+            draw_circle(x + 3.0 * s, y + 5.0 * s, 3.5 * s, Color::new(0.50, 0.42, 0.30, 1.0));
+        }
+        11 => {
+            draw_poly(x, y - ry - 3.0 * s, 3, 4.5 * s, -90.0, GOLD);
+        }
+        12 => {
+            draw_text("101", x - 8.0 * s, y + 3.0 * s, 14.0 * s, LIME);
+        }
+        _ => {}
+    }
+}
+
+fn draw_yard(r: Rect, o: Vec2, label: &str, mine: bool, eggs: &[usize]) {
+    let x = r.x + o.x;
+    let y = r.y + o.y;
+    draw_rectangle(x, y, r.w, r.h, Color::new(0.38, 0.62, 0.30, 1.0));
+    let fc = Color::new(0.55, 0.38, 0.20, 1.0);
+    draw_rectangle_lines(x, y, r.w, r.h, 8.0, fc);
+    let pc = darker(fc, 0.75);
+    for px in [x, x + r.w / 2.0, x + r.w] {
+        draw_circle(px, y, 7.0, pc);
+        draw_circle(px, y + r.h, 7.0, pc);
+    }
+    draw_circle(x, y + r.h / 2.0, 7.0, pc);
+    draw_circle(x + r.w, y + r.h / 2.0, 7.0, pc);
+    let dim = measure_text(label, None, 30, 1.0);
+    draw_text(label, x + r.w / 2.0 - dim.width / 2.0, y - 14.0, 30.0, if mine { GOLD } else { WHITE });
+    for (i, &k) in eggs.iter().take(28).enumerate() {
+        let col = (i % 7) as f32;
+        let row = (i / 7) as f32;
+        draw_egg(x + 32.0 + col * 40.0, y + 40.0 + row * 55.0, k, 0.85);
+    }
+    if eggs.len() > 28 {
+        draw_text(&format!("+{} more", eggs.len() - 28), x + 10.0, y + r.h - 12.0, 24.0, WHITE);
+    }
+}
+
+fn draw_treadmill(r: Rect, o: Vec2, tier: usize, t: f32) {
+    let x = r.x + o.x;
+    let y = r.y + o.y;
+    let c = T_COLORS[tier];
+    draw_rectangle(x - 7.0, y - 7.0, r.w + 14.0, r.h + 14.0, darker(c, 0.45));
+    draw_rectangle(x, y, r.w, r.h, Color::new(0.14, 0.14, 0.16, 1.0));
+    let off = (t * 90.0) % 22.0;
+    let mut sy = y - 22.0 + off;
+    while sy < y + r.h {
+        let yy = sy.max(y);
+        let hh = (sy + 5.0).min(y + r.h) - yy;
+        if hh > 0.0 {
+            draw_rectangle(x, yy, r.w, hh, c);
+        }
+        sy += 22.0;
+    }
+    let label = T_NAMES[tier];
+    let dim = measure_text(label, None, 24, 1.0);
+    draw_text(label, x + r.w / 2.0 - dim.width / 2.0, y + r.h + 26.0, 24.0, c);
+}
+
+fn draw_monster(m: &Monster, o: Vec2, player: Vec2, t: f32) {
+    let p = m.pos + o;
+    let bob = (t * 2.0 + m.r).sin() * 3.0;
+    let dk = darker(m.color, 0.6);
+    draw_circle(p.x - m.r * 0.5, p.y + m.r * 0.85, m.r * 0.25, dk);
+    draw_circle(p.x + m.r * 0.5, p.y + m.r * 0.85, m.r * 0.25, dk);
+    draw_circle(p.x, p.y + bob, m.r, m.color);
+    draw_poly(p.x - m.r * 0.55, p.y - m.r * 0.78 + bob, 3, m.r * 0.28, -90.0, darker(m.color, 0.45));
+    draw_poly(p.x + m.r * 0.55, p.y - m.r * 0.78 + bob, 3, m.r * 0.28, -90.0, darker(m.color, 0.45));
+    let ex = m.r * 0.35;
+    let ey = p.y - m.r * 0.25 + bob;
+    if m.awake > 0.5 {
+        let look = (player - m.pos).normalize_or_zero() * m.r * 0.08;
+        for sx in [-1.0f32, 1.0] {
+            draw_circle(p.x + sx * ex, ey, m.r * 0.22, WHITE);
+            draw_circle(p.x + sx * ex + look.x, ey + look.y, m.r * 0.11, RED);
+        }
+        draw_rectangle(p.x - m.r * 0.4, p.y + m.r * 0.30 + bob, m.r * 0.8, m.r * 0.22, Color::new(0.30, 0.05, 0.05, 1.0));
+        for i in 0..4 {
+            draw_poly(p.x - m.r * 0.3 + i as f32 * m.r * 0.2, p.y + m.r * 0.36 + bob, 3, m.r * 0.07, 90.0, WHITE);
+        }
+    } else {
+        for sx in [-1.0f32, 1.0] {
+            draw_line(p.x + sx * ex - m.r * 0.15, ey, p.x + sx * ex + m.r * 0.15, ey, 3.0, BLACK);
+        }
+        let a = ((t * 1.5).sin() * 0.5 + 0.5) * 0.7 + 0.3;
+        draw_text("Z z z", p.x + m.r * 0.4, p.y - m.r - 14.0 + (t * 1.5).sin() * 4.0, 30.0, Color::new(1.0, 1.0, 1.0, a));
+    }
+}
+
+fn draw_walls(o: Vec2) {
+    let sc = Color::new(0.44, 0.44, 0.47, 1.0);
+    let dark = Color::new(0.30, 0.30, 0.33, 1.0);
+    draw_rectangle(o.x, o.y, WORLD_W, WALL, sc);
+    draw_rectangle(o.x, o.y + WORLD_H - WALL, WORLD_W, WALL, sc);
+    draw_rectangle(o.x, o.y, WALL, WORLD_H, sc);
+    draw_rectangle(o.x + WORLD_W - WALL, o.y, WALL, WORLD_H, sc);
+    let mut x = 0.0;
+    while x < WORLD_W {
+        draw_line(o.x + x, o.y, o.x + x, o.y + WALL, 2.0, dark);
+        draw_line(o.x + x, o.y + WORLD_H - WALL, o.x + x, o.y + WORLD_H, 2.0, dark);
+        x += 64.0;
+    }
+    let mut y = 0.0;
+    while y < WORLD_H {
+        draw_line(o.x, o.y + y, o.x + WALL, o.y + y, 2.0, dark);
+        draw_line(o.x + WORLD_W - WALL, o.y + y, o.x + WORLD_W, o.y + y, 2.0, dark);
+        y += 64.0;
+    }
+    draw_line(o.x, o.y + WALL / 2.0, o.x + WORLD_W, o.y + WALL / 2.0, 2.0, dark);
+    draw_line(o.x, o.y + WORLD_H - WALL / 2.0, o.x + WORLD_W, o.y + WORLD_H - WALL / 2.0, 2.0, dark);
+    draw_line(o.x + WALL / 2.0, o.y, o.x + WALL / 2.0, o.y + WORLD_H, 2.0, dark);
+    draw_line(o.x + WORLD_W - WALL / 2.0, o.y, o.x + WORLD_W - WALL / 2.0, o.y + WORLD_H, 2.0, dark);
+}
+
+fn window_conf() -> Conf {
+    Conf {
+        window_title: "Egg Stealer".to_owned(),
+        window_width: 1280,
+        window_height: 800,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(window_conf)]
+async fn main() {
+    macroquad::rand::srand(macroquad::miniquad::date::now() as u64);
+
+    let yards: Vec<Rect> = (0..4)
+        .map(|i| Rect::new(130.0, 120.0 + i as f32 * 350.0, 300.0, 250.0))
+        .collect();
+    let yard_names = ["YOUR YARD", "Maya's Yard", "Kai's Yard", "Zoe's Yard"];
+    let treadmills: Vec<Rect> = yards
+        .iter()
+        .map(|y| Rect::new(y.x + y.w + 30.0, y.y + y.h * 0.5 - 55.0, 70.0, 110.0))
+        .collect();
+
+    let mut player = SPAWN;
+    let mut money: f64 = 0.0;
+    let mut training: f32 = 0.0;
+    let mut tier: usize = 0;
+    let mut carrying: Option<usize> = None;
+    let mut yard_eggs: Vec<usize> = Vec::new();
+    let mut msg = String::new();
+    let mut msg_t: f32 = 0.0;
+    let mut msg_c = WHITE;
+
+    let mut eggs: Vec<Egg> = (0..55)
+        .map(|_| Egg { pos: random_egg_pos(), kind: random_kind(), phase: rng(0.0, 6.28) })
+        .collect();
+    let mut spawn_t: f32 = 1.2;
+
+    let mut monsters = vec![
+        Monster { pos: vec2(1450.0, 350.0), home: vec2(1450.0, 350.0), r: 70.0, color: Color::new(0.55, 0.15, 0.15, 1.0), awake: 0.0 },
+        Monster { pos: vec2(1950.0, 280.0), home: vec2(1950.0, 280.0), r: 85.0, color: Color::new(0.40, 0.15, 0.50, 1.0), awake: 0.0 },
+        Monster { pos: vec2(2320.0, 800.0), home: vec2(2320.0, 800.0), r: 95.0, color: Color::new(0.15, 0.35, 0.18, 1.0), awake: 0.0 },
+        Monster { pos: vec2(1550.0, 1150.0), home: vec2(1550.0, 1150.0), r: 75.0, color: Color::new(0.15, 0.20, 0.40, 1.0), awake: 0.0 },
+        Monster { pos: vec2(2050.0, 1280.0), home: vec2(2050.0, 1280.0), r: 80.0, color: Color::new(0.20, 0.20, 0.22, 1.0), awake: 0.0 },
+    ];
+
+    loop {
+        let dt = get_frame_time().min(0.05);
+        let t = get_time() as f32;
+
+        // ---- input & movement ----
+        let mut dir = Vec2::ZERO;
+        if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) { dir.y -= 1.0; }
+        if is_key_down(KeyCode::S) || is_key_down(KeyCode::Down) { dir.y += 1.0; }
+        if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) { dir.x -= 1.0; }
+        if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) { dir.x += 1.0; }
+        let moving = dir != Vec2::ZERO;
+        let mut speed = 230.0 + (training / 100.0) * 270.0;
+        if carrying.is_some() { speed *= 0.92; }
+        player += dir.normalize_or_zero() * speed * dt;
+        player.x = player.x.clamp(WALL + 20.0, WORLD_W - WALL - 20.0);
+        player.y = player.y.clamp(WALL + 20.0, WORLD_H - WALL - 20.0);
+
+        // ---- treadmill training ----
+        let on_tm = treadmills[0].contains(player);
+        if on_tm {
+            training = (training + dt * T_MULT[tier] * 1.2).min(100.0);
+        }
+
+        // ---- treadmill upgrade ----
+        let tm_center = vec2(treadmills[0].x + 35.0, treadmills[0].y + 55.0);
+        let near_tm = player.distance(tm_center) < 150.0;
+        if is_key_pressed(KeyCode::E) && near_tm && tier < 6 {
+            if money >= T_COSTS[tier + 1] {
+                money -= T_COSTS[tier + 1];
+                tier += 1;
+                msg = format!("{} Treadmill unlocked!", T_NAMES[tier]);
+                msg_c = T_COLORS[tier];
+                msg_t = 2.5;
+            } else {
+                msg = format!("Need ${} for the {} Treadmill!", T_COSTS[tier + 1] as u64, T_NAMES[tier + 1]);
+                msg_c = RED;
+                msg_t = 2.0;
+            }
+        }
+
+        // ---- steal eggs ----
+        if carrying.is_none() {
+            if let Some(i) = eggs.iter().position(|e| e.pos.distance(player) < 42.0) {
+                let e = eggs.swap_remove(i);
+                carrying = Some(e.kind);
+                let (rn, rc) = rarity(e.kind);
+                msg = format!("Stole a {} {}! RUN!", rn, egg_name(e.kind));
+                msg_c = rc;
+                msg_t = 2.5;
+            }
+        }
+
+        // ---- deposit in your yard ----
+        if let Some(k) = carrying {
+            if yards[0].contains(player) {
+                let bonus = egg_value(k) * 5.0;
+                money += bonus;
+                yard_eggs.push(k);
+                carrying = None;
+                msg = format!("+${} — {} is safe in your yard!", bonus as u64, egg_name(k));
+                msg_c = GREEN;
+                msg_t = 2.5;
+            }
+        }
+
+        // ---- passive income ----
+        let income: f64 = yard_eggs.iter().map(|&k| egg_value(k) / 2.0).sum();
+        money += income * dt as f64;
+
+        // ---- monsters ----
+        let chasing = carrying.is_some() && player.x > LINE_X;
+        for m in monsters.iter_mut() {
+            if chasing {
+                m.awake = (m.awake + dt * 1.5).min(1.0);
+                if m.awake > 0.5 {
+                    let mspeed = 300.0 - m.r * 0.5;
+                    m.pos += (player - m.pos).normalize_or_zero() * mspeed * dt;
+                }
+            } else {
+                m.awake = (m.awake - dt * 1.5).max(0.0);
+                let to_home = m.home - m.pos;
+                let d = to_home.length();
+                if d > 5.0 {
+                    m.pos += to_home / d * (120.0 * dt).min(d);
+                }
+            }
+            m.pos.x = m.pos.x.clamp(LINE_X + m.r + 12.0, WORLD_W - WALL - m.r);
+            m.pos.y = m.pos.y.clamp(WALL + m.r, WORLD_H - WALL - m.r);
+        }
+        // keep monsters from stacking
+        for i in 0..monsters.len() {
+            for j in (i + 1)..monsters.len() {
+                let d = monsters[j].pos - monsters[i].pos;
+                let min_d = (monsters[i].r + monsters[j].r) * 0.8;
+                let len = d.length();
+                if len > 0.0 && len < min_d {
+                    let push = d / len * (min_d - len) * 0.5;
+                    monsters[i].pos -= push;
+                    monsters[j].pos += push;
+                }
+            }
+        }
+        // caught!
+        if carrying.is_some() {
+            for m in monsters.iter() {
+                if m.awake > 0.5 && m.pos.distance(player) < m.r + 18.0 {
+                    let k = carrying.take().unwrap();
+                    eggs.push(Egg { pos: random_egg_pos(), kind: k, phase: rng(0.0, 6.28) });
+                    player = SPAWN;
+                    msg = "CAUGHT! The monster took the egg back!".to_string();
+                    msg_c = RED;
+                    msg_t = 3.0;
+                    break;
+                }
+            }
+        }
+
+        // ---- egg respawn ----
+        spawn_t -= dt;
+        if spawn_t <= 0.0 {
+            spawn_t = 1.2;
+            if eggs.len() < 60 {
+                eggs.push(Egg { pos: random_egg_pos(), kind: random_kind(), phase: rng(0.0, 6.28) });
+            }
+        }
+
+        if msg_t > 0.0 { msg_t -= dt; }
+
+        // ================= DRAW =================
+        clear_background(Color::new(0.08, 0.16, 0.09, 1.0));
+        let o = vec2(screen_width() / 2.0, screen_height() / 2.0) - player;
+
+        // grass
+        draw_rectangle(o.x, o.y, WORLD_W, WORLD_H, Color::new(0.30, 0.55, 0.25, 1.0));
+        draw_rectangle(o.x + LINE_X, o.y, WORLD_W - LINE_X, WORLD_H, Color::new(0.21, 0.43, 0.22, 1.0));
+        let tuft = Color::new(0.10, 0.30, 0.12, 0.35);
+        for gx in 0..29 {
+            for gy in 0..18 {
+                let h = (gx * 53 + gy * 97) % 73;
+                let px = gx as f32 * 90.0 + (h % 37) as f32 + 60.0;
+                let py = gy as f32 * 87.0 + (h % 29) as f32 + 60.0;
+                draw_circle(px + o.x, py + o.y, 3.0 + (h % 3) as f32, tuft);
+            }
+        }
+        draw_text("SAFE ZONE", o.x + 480.0, o.y + WORLD_H - 90.0, 60.0, Color::new(1.0, 1.0, 1.0, 0.25));
+        draw_text("EGG ZONE — MONSTERS!", o.x + 1450.0, o.y + WORLD_H - 90.0, 60.0, Color::new(1.0, 0.5, 0.5, 0.30));
+
+        // white line
+        draw_rectangle(o.x + LINE_X - 6.0, o.y + WALL, 12.0, WORLD_H - 2.0 * WALL, WHITE);
+
+        // yards + treadmills
+        for (i, y) in yards.iter().enumerate() {
+            let mine = i == 0;
+            draw_yard(*y, o, yard_names[i], mine, if mine { &yard_eggs } else { &[] });
+            draw_treadmill(treadmills[i], o, if mine { tier } else { 0 }, t);
+        }
+
+        // eggs
+        for e in eggs.iter() {
+            let bob = (t * 2.0 + e.phase).sin() * 2.0;
+            draw_ellipse(e.pos.x + o.x, e.pos.y + o.y + 16.0, 12.0, 5.0, 0.0, Color::new(0.0, 0.0, 0.0, 0.20));
+            draw_egg(e.pos.x + o.x, e.pos.y + o.y + bob, e.kind, 1.0);
+        }
+
+        // monsters
+        for m in monsters.iter() {
+            draw_monster(m, o, player, t);
+        }
+
+        // player
+        let pp = player + o;
+        draw_ellipse(pp.x, pp.y + 24.0, 16.0, 6.0, 0.0, Color::new(0.0, 0.0, 0.0, 0.25));
+        let leg = if moving { (t * 14.0).sin() * 6.0 } else { 0.0 };
+        draw_circle(pp.x - 8.0, pp.y + 18.0 + leg.max(0.0) * 0.5, 5.5, DARKBLUE);
+        draw_circle(pp.x + 8.0, pp.y + 18.0 + (-leg).max(0.0) * 0.5, 5.5, DARKBLUE);
+        draw_circle(pp.x, pp.y, 19.0, Color::new(0.25, 0.55, 0.95, 1.0));
+        let look = dir.normalize_or_zero() * 4.0;
+        for sx in [-1.0f32, 1.0] {
+            draw_circle(pp.x + sx * 7.0 + look.x, pp.y - 4.0 + look.y, 5.0, WHITE);
+            draw_circle(pp.x + sx * 7.0 + look.x * 1.5, pp.y - 4.0 + look.y * 1.5, 2.4, BLACK);
+        }
+        if let Some(k) = carrying {
+            draw_egg(pp.x, pp.y - 46.0 + (t * 3.0).sin() * 3.0, k, 1.1);
+            // arrow pointing home
+            let home = vec2(yards[0].x + yards[0].w / 2.0, yards[0].y + yards[0].h / 2.0);
+            let hd = (home - player).normalize_or_zero();
+            let deg = hd.y.atan2(hd.x).to_degrees();
+            draw_poly(pp.x + hd.x * 70.0, pp.y + hd.y * 70.0, 3, 13.0, deg, GOLD);
+        }
+
+        // walls
+        draw_walls(o);
+
+        // ================= HUD =================
+        draw_rectangle(12.0, 12.0, 400.0, 130.0, Color::new(0.0, 0.0, 0.0, 0.55));
+        draw_text(&format!("$ {}", money.floor() as i64), 26.0, 54.0, 44.0, Color::new(0.4, 1.0, 0.5, 1.0));
+        draw_text(&format!("Income: ${}/s", income as u64), 26.0, 86.0, 26.0, LIGHTGRAY);
+        draw_text(
+            &format!("Speed: {:.0}   Training: {:.0}%   Treadmill: {}", speed, training, T_NAMES[tier]),
+            26.0, 116.0, 24.0, LIGHTGRAY,
+        );
+
+        let types: HashSet<usize> = yard_eggs.iter().copied().collect();
+        let right = format!("Eggs in yard: {}    Types found: {}/169", yard_eggs.len(), types.len());
+        let dim = measure_text(&right, None, 26, 1.0);
+        draw_rectangle(screen_width() - dim.width - 40.0, 12.0, dim.width + 28.0, 42.0, Color::new(0.0, 0.0, 0.0, 0.55));
+        draw_text(&right, screen_width() - dim.width - 26.0, 40.0, 26.0, WHITE);
+
+        if let Some(k) = carrying {
+            let (rn, rc) = rarity(k);
+            let s = format!("Carrying: {} {} (worth ${}) — get it to YOUR YARD!", rn, egg_name(k), egg_value(k) as u64);
+            let d = measure_text(&s, None, 28, 1.0);
+            draw_rectangle(screen_width() / 2.0 - d.width / 2.0 - 14.0, 58.0, d.width + 28.0, 40.0, Color::new(0.0, 0.0, 0.0, 0.6));
+            draw_text(&s, screen_width() / 2.0 - d.width / 2.0, 86.0, 28.0, rc);
+        }
+
+        if near_tm {
+            let s = if tier < 6 {
+                format!("[E] Upgrade to {} Treadmill — ${}", T_NAMES[tier + 1], T_COSTS[tier + 1] as u64)
+            } else {
+                "HACKER TREADMILL — maximum power!".to_string()
+            };
+            let ok = tier >= 6 || money >= T_COSTS[(tier + 1).min(6)];
+            let d = measure_text(&s, None, 30, 1.0);
+            draw_rectangle(screen_width() / 2.0 - d.width / 2.0 - 14.0, screen_height() - 96.0, d.width + 28.0, 44.0, Color::new(0.0, 0.0, 0.0, 0.6));
+            draw_text(&s, screen_width() / 2.0 - d.width / 2.0, screen_height() - 65.0, 30.0, if ok { GREEN } else { RED });
+        }
+
+        if msg_t > 0.0 {
+            let a = msg_t.min(1.0);
+            let d = measure_text(&msg, None, 42, 1.0);
+            draw_text(
+                &msg,
+                screen_width() / 2.0 - d.width / 2.0,
+                screen_height() * 0.30,
+                42.0,
+                Color::new(msg_c.r, msg_c.g, msg_c.b, a),
+            );
+        }
+
+        draw_text(
+            "WASD move · steal eggs across the white line · drop them in YOUR YARD · stand on the treadmill to get faster",
+            16.0, screen_height() - 16.0, 20.0, Color::new(1.0, 1.0, 1.0, 0.6),
+        );
+
+        next_frame().await
+    }
+}
