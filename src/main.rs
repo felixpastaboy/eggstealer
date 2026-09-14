@@ -1,18 +1,24 @@
-use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::mouse::MouseMotion;
 use bevy::math::Affine2;
-use bevy::pbr::{CascadeShadowConfigBuilder, DistanceFog, FogFalloff};
+use bevy::core_pipeline::bloom::Bloom;
+use bevy::core_pipeline::fxaa::Fxaa;
+use bevy::pbr::{
+    CascadeShadowConfigBuilder, DirectionalLightShadowMap, DistanceFog, FogFalloff,
+    NotShadowCaster, NotShadowReceiver, ScreenSpaceAmbientOcclusion,
+};
 use bevy::prelude::*;
-use bevy::render::mesh::{Indices, PrimitiveTopology};
+use bevy::render::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::window::{CursorGrabMode, PrimaryWindow};
+use serde::{Deserialize, Serialize};
 use std::f32::consts::{PI, TAU};
 
 // World layout (meters). Safe zone is x < LINE_X, egg zone is x > LINE_X.
-const WORLD_X: f32 = 260.0;
-const WORLD_Z: f32 = 156.0;
-const LINE_X: f32 = 105.0;
+const WORLD_X: f32 = 150.0;
+const WORLD_Z: f32 = 124.0;
+const LINE_X: f32 = 65.0;
 const SPAWN: Vec3 = Vec3::new(56.0, 1.7, 24.5);
 const EYE: f32 = 1.7;
 
@@ -53,14 +59,146 @@ const T_RGB: [(f32, f32, f32); 7] = [
     (0.10, 0.90, 0.30),
 ];
 
-// Your yard: x 13..43, z 12..37. Treadmill just east of it.
+// Your yard: x 13..43, z 12..37. Treadmill just east of it, off the gate path.
 const YARD: (f32, f32, f32, f32) = (13.0, 43.0, 12.0, 37.0);
-const TM_CENTER: Vec3 = Vec3::new(46.6, 0.0, 24.5);
-const PORTAL_POS: Vec3 = Vec3::new(15.0, 0.0, 24.5);
-const LEVEL_COST: [f64; 3] = [1_000_000.0, 2_000_000.0, 3_000_000.0];
+const YARD_GAP: f32 = 27.0; // z spacing between the four yards
+const INV_SLOTS: usize = 10;
+
+// day/night cycle on the wall clock, so it keeps running while the game is closed
+const DAY_SECS: f64 = 30.0 * 60.0;
+const NIGHT_SECS: f64 = 10.0 * 60.0;
+// hatch times: a plain white egg takes 5 minutes, a Hacker Rainbow egg an hour
+const HATCH_MIN_SECS: f64 = 5.0 * 60.0;
+const HATCH_MAX_SECS: f64 = 60.0 * 60.0;
+const YARD_MAX_SLOTS: usize = 48;
+
+// Gear Station / Upgrader, north of the gate path (the treadmill is south of it)
+const GEAR_POS: Vec3 = Vec3::new(48.6, 0.0, 18.0);
+const GEAR_NAMES: [&str; 3] = ["Freeze Gun", "Ice Sword", "Blizzard Orb"];
+const GEAR_COSTS: [f64; 3] = [1500.0, 6000.0, 25000.0];
+const GEAR_FREEZE: [f32; 3] = [10.0, 20.0, 30.0];
+const GEAR_RANGE: [f32; 3] = [30.0, 8.0, f32::MAX];
+const GEAR_COOLDOWN: [f32; 3] = [12.0, 20.0, 60.0];
+const GEAR_KEYS: [KeyCode; 3] = [KeyCode::KeyF, KeyCode::KeyG, KeyCode::KeyH];
+const GEAR_KEY_NAMES: [&str; 3] = ["F", "G", "H"];
+
+fn now_unix() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn is_night_at(now: f64) -> bool {
+    // EGG_NIGHT=1 / EGG_NIGHT=0 forces the phase (handy for previewing the night wall)
+    static FORCE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let force = FORCE.get_or_init(|| match std::env::var("EGG_NIGHT").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    });
+    force.unwrap_or_else(|| now.rem_euclid(DAY_SECS + NIGHT_SECS) >= DAY_SECS)
+}
+
+// seconds until the current phase (day or night) ends
+fn phase_left(now: f64) -> f64 {
+    let c = now.rem_euclid(DAY_SECS + NIGHT_SECS);
+    if c < DAY_SECS {
+        DAY_SECS - c
+    } else {
+        DAY_SECS + NIGHT_SECS - c
+    }
+}
+
+// what an egg pays out when it finishes hatching
+fn hatch_payout(kind: usize, level: usize) -> f64 {
+    egg_value(kind) * 200.0 * level_mult(level)
+}
+
+fn hatch_secs(kind: usize) -> f64 {
+    HATCH_MIN_SECS + (HATCH_MAX_SECS - HATCH_MIN_SECS) * (egg_value(kind) - 1.0) / 168.0
+}
+
+fn fmt_dur(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+// every yard has its own Gear Station at the same relative spot
+fn gear_pos(yi: usize) -> Vec3 {
+    Vec3::new(GEAR_POS.x, 0.0, GEAR_POS.z + yi as f32 * YARD_GAP)
+}
+
+fn near_gear(p: Vec3) -> bool {
+    (0..4).any(|yi| {
+        let g = gear_pos(yi);
+        Vec2::new(p.x - g.x, p.z - g.z).length() < 4.0
+    })
+}
+
+// where the n-th egg/pet stands in your yard (8 per row)
+fn slot_pos(slot: usize) -> Vec3 {
+    let (col, row) = (slot % 8, slot / 8);
+    Vec3::new(15.5 + col as f32 * 3.5, 0.0, 14.5 + row as f32 * 3.6)
+}
+const TM_CENTER: Vec3 = Vec3::new(48.6, 0.0, 31.0);
+// every yard has a portal at its back (west) fence, centred in z
+fn portal_pos(yi: usize) -> Vec3 {
+    Vec3::new(
+        YARD.0 + 2.0,
+        0.0,
+        YARD.2 + yi as f32 * YARD_GAP + (YARD.3 - YARD.2) / 2.0,
+    )
+}
+const N_WORLDS: usize = 10;
+// cost to unlock world 2..=10 (index = world - 2)
+const LEVEL_COST: [f64; N_WORLDS - 1] = [
+    1_000_000.0,
+    2_000_000.0,
+    5_000_000.0,
+    10_000_000.0,
+    25_000_000.0,
+    50_000_000.0,
+    100_000_000.0,
+    250_000_000.0,
+    500_000_000.0,
+];
+// reach this much money in World 10 to beat the game
+const WIN_MONEY: f64 = 1_000_000_000.0;
 
 fn level_mult(level: usize) -> f64 {
-    [1.0, 5.0, 25.0][level - 1]
+    [
+        1.0, 5.0, 25.0, 100.0, 500.0, 2_000.0, 8_000.0, 30_000.0, 100_000.0, 500_000.0,
+    ][level - 1]
+}
+
+// the next world you have not unlocked yet, if any
+fn next_locked(unlocked: &[bool; N_WORLDS]) -> Option<usize> {
+    (2..=N_WORLDS).find(|&w| !unlocked[w - 1])
+}
+
+fn fmt_money(v: f64) -> String {
+    let n = v.max(0.0).floor() as u64;
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn near_portal(p: Vec3) -> bool {
+    (0..4).any(|yi| {
+        let pp = portal_pos(yi);
+        Vec2::new(p.x - pp.x, p.z - pp.z).length() < 3.0
+    })
 }
 
 fn egg_value(kind: usize) -> f64 {
@@ -91,7 +229,7 @@ fn random_kind() -> usize {
 }
 fn random_egg_xz() -> (f32, f32) {
     (
-        112.0 + fastrand::f32() * (WORLD_X - 6.0 - 112.0),
+        LINE_X + 7.0 + fastrand::f32() * (WORLD_X - 6.0 - LINE_X - 7.0),
         6.0 + fastrand::f32() * (WORLD_Z - 12.0),
     )
 }
@@ -108,21 +246,20 @@ struct WorldEgg {
 }
 
 #[derive(Component)]
-struct CarriedEgg {
-    slot: usize,
-}
+struct CarriedEgg;
 
 #[derive(Component)]
 struct Hatching {
     kind: usize,
-    t: f32,
+    slot: usize,
+    hatch_at: f64, // unix seconds
 }
 
 #[derive(Component)]
-struct Pet {
-    phase: f32,
-    age: f32,
-}
+struct IceBlock;
+
+#[derive(Component)]
+struct NightWall;
 
 #[derive(Component)]
 struct ShellBit {
@@ -148,33 +285,147 @@ struct MonsterLimb {
 struct PortalMenu;
 
 #[derive(Component)]
+struct MainMenu;
+
+#[derive(Component)]
+struct MenuButton(usize); // 0 online, 1 multiplayer, 2 single player
+
+#[derive(Component)]
+struct MenuStatus;
+
+#[derive(Component)]
+struct PauseMenu;
+
+#[derive(Component)]
+struct PauseButton(usize); // 0 continue, 1 quit and save
+
+#[derive(Component)]
 struct WorldButton(usize);
 
 #[derive(Component)]
 struct WorldButtonText(usize);
 
-// axis-aligned fence walls you cannot walk through (east sides have a gate gap)
-struct FenceSeg {
-    vertical: bool,
-    line: f32,
-    a: f32,
-    b: f32,
+// Solid obstacles in the XZ plane (axis-aligned boxes): fence rails and treadmill frames.
+#[derive(Clone, Copy)]
+struct Blocker {
+    x0: f32,
+    x1: f32,
+    z0: f32,
+    z1: f32,
 }
 
-fn fence_segments() -> Vec<FenceSeg> {
+const PLAYER_RADIUS: f32 = 0.32;
+const FENCE_HALF: f32 = 0.08;
+const TM_BELT_L: f32 = 2.8; // belt length (x)
+const TM_BELT_W: f32 = 1.6; // belt width (z)
+const TM_DECK_H: f32 = 0.27; // top of the belt
+
+fn treadmill_center(yi: usize) -> Vec3 {
+    Vec3::new(TM_CENTER.x, 0.0, TM_CENTER.z + yi as f32 * YARD_GAP)
+}
+
+fn blockers() -> Vec<Blocker> {
     let mut v = Vec::new();
+    let mut wall = |vertical: bool, line: f32, a: f32, b: f32| {
+        if vertical {
+            v.push(Blocker { x0: line - FENCE_HALF, x1: line + FENCE_HALF, z0: a, z1: b });
+        } else {
+            v.push(Blocker { x0: a, x1: b, z0: line - FENCE_HALF, z1: line + FENCE_HALF });
+        }
+    };
     for yi in 0..4 {
-        let (x0, x1) = (13.0, 43.0);
-        let z0 = 12.0 + yi as f32 * 35.0;
-        let z1 = z0 + 25.0;
+        let (x0, x1) = (YARD.0, YARD.1);
+        let z0 = YARD.2 + yi as f32 * YARD_GAP;
+        let z1 = z0 + (YARD.3 - YARD.2);
         let gate = (z0 + z1) / 2.0;
-        v.push(FenceSeg { vertical: false, line: z0, a: x0, b: x1 });
-        v.push(FenceSeg { vertical: false, line: z1, a: x0, b: x1 });
-        v.push(FenceSeg { vertical: true, line: x0, a: z0, b: z1 });
-        v.push(FenceSeg { vertical: true, line: x1, a: z0, b: gate - 2.0 });
-        v.push(FenceSeg { vertical: true, line: x1, a: gate + 2.0, b: z1 });
+        wall(false, z0, x0, x1);
+        wall(false, z1, x0, x1);
+        wall(true, x0, z0, z1);
+        // east side has a 4 m gate gap in the middle
+        wall(true, x1, z0, gate - 2.0);
+        wall(true, x1, gate + 2.0, z1);
+    }
+    for yi in 0..4 {
+        // treadmill: side frames and the console at the west end; you step on from the east
+        let c = treadmill_center(yi);
+        let hl = TM_BELT_L / 2.0 + 0.1;
+        let hw = TM_BELT_W / 2.0;
+        for side in [-1.0, 1.0] {
+            let zc = c.z + side * (hw + 0.06);
+            v.push(Blocker { x0: c.x - hl, x1: c.x + hl, z0: zc - 0.06, z1: zc + 0.06 });
+        }
+        v.push(Blocker {
+            x0: c.x - hl - 0.16,
+            x1: c.x - hl + 0.06,
+            z0: c.z - hw - 0.12,
+            z1: c.z + hw + 0.12,
+        });
+    }
+    // gear station kiosks
+    for yi in 0..4 {
+        let g = gear_pos(yi);
+        v.push(Blocker {
+            x0: g.x - 1.1,
+            x1: g.x + 1.1,
+            z0: g.z - 0.9,
+            z1: g.z + 0.9,
+        });
     }
     v
+}
+
+// Push a circle of radius `r` out of every blocker it overlaps.
+fn resolve_blockers(p: &mut Vec3, r: f32, blockers: &[Blocker]) {
+    for b in blockers {
+        let cx = p.x.clamp(b.x0, b.x1);
+        let cz = p.z.clamp(b.z0, b.z1);
+        let dx = p.x - cx;
+        let dz = p.z - cz;
+        let d2 = dx * dx + dz * dz;
+        if d2 >= r * r {
+            continue;
+        }
+        if d2 > 1e-6 {
+            let d = d2.sqrt();
+            let push = r - d;
+            p.x += dx / d * push;
+            p.z += dz / d * push;
+        } else {
+            // centre is inside the box: leave through the nearest face
+            let lx = p.x - b.x0;
+            let rx = b.x1 - p.x;
+            let lz = p.z - b.z0;
+            let rz = b.z1 - p.z;
+            let m = lx.min(rx).min(lz).min(rz);
+            if m == lx {
+                p.x = b.x0 - r;
+            } else if m == rx {
+                p.x = b.x1 + r;
+            } else if m == lz {
+                p.z = b.z0 - r;
+            } else {
+                p.z = b.z1 + r;
+            }
+        }
+    }
+}
+
+// Move `p` by `delta`, sub-stepping so a fast runner can never tunnel through a rail.
+fn move_blocked(p: &mut Vec3, delta: Vec3, blockers: &[Blocker]) {
+    let total = delta.length();
+    let steps = (total / 0.25).ceil().max(1.0) as usize;
+    let step = delta / steps as f32;
+    for _ in 0..steps {
+        *p += step;
+        resolve_blockers(p, PLAYER_RADIUS, blockers);
+    }
+}
+
+fn on_deck(p: Vec3) -> bool {
+    (0..4).any(|yi| {
+        let c = treadmill_center(yi);
+        (p.x - c.x).abs() < TM_BELT_L / 2.0 && (p.z - c.z).abs() < TM_BELT_W / 2.0
+    })
 }
 
 #[derive(Component)]
@@ -184,6 +435,7 @@ struct Monster {
     scale: f32,
     awake: f32,
     phase: f32,
+    frozen: f32,
 }
 
 #[derive(Component)]
@@ -197,19 +449,25 @@ enum Hud {
     Carry,
     Prompt,
     Msg,
+    Clock,
+    Gear,
+    Night,
 }
 
 #[derive(Resource)]
 struct Game {
+    in_menu: bool,
+    paused: bool,
     money: f64,
     training: f32,
     tier: usize,
-    inventory: Vec<usize>,
+    inventory: [Option<usize>; INV_SLOTS],
+    selected: usize,
+    held_kind: Option<usize>,
     level: usize,
-    unlocked: [bool; 3],
+    unlocked: [bool; N_WORLDS],
     menu_open: bool,
     won: bool,
-    yard_slots: usize,
     portal_lit: bool,
     yard_eggs: Vec<usize>,
     msg: String,
@@ -226,49 +484,256 @@ struct Game {
     safe_grass_mat: Handle<StandardMaterial>,
     zone_grass_mat: Handle<StandardMaterial>,
     sphere_mesh: Handle<Mesh>,
-    beak_mesh: Handle<Mesh>,
-    beak_mat: Handle<StandardMaterial>,
-    black_mat: Handle<StandardMaterial>,
     defeat_sound: Handle<AudioSource>,
     pickup_sound: Handle<AudioSource>,
     on_treadmill: bool,
+    gear: usize,
+    gear_cd: [f32; 3],
+    night: bool,
+    night_applied: Option<bool>,
+    ice_mat: Handle<StandardMaterial>,
+    cube_mesh: Handle<Mesh>,
+    eye_h: f32,
+    sky_mesh: Handle<Mesh>,
+    sun_mat: Handle<StandardMaterial>,
 }
+
+impl Game {
+    fn carrying(&self) -> usize {
+        self.inventory.iter().flatten().count()
+    }
+    fn has_eggs(&self) -> bool {
+        self.inventory.iter().any(|s| s.is_some())
+    }
+    fn carried(&self) -> impl Iterator<Item = usize> + '_ {
+        self.inventory.iter().flatten().copied()
+    }
+    fn take_all(&mut self) -> Vec<usize> {
+        let v: Vec<usize> = self.carried().collect();
+        self.inventory = [None; INV_SLOTS];
+        v
+    }
+    // the selected slot if it is free, otherwise the first free slot
+    fn free_slot(&self) -> Option<usize> {
+        if self.inventory[self.selected].is_none() {
+            return Some(self.selected);
+        }
+        self.inventory.iter().position(|s| s.is_none())
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct SaveData {
+    money: f64,
+    training: f32,
+    tier: usize,
+    level: usize,
+    unlocked: Vec<bool>,
+    won: bool,
+    inventory: Vec<Option<usize>>,
+    gear: usize,
+    yard_eggs: Vec<usize>,              // kinds hatched so far (for the Types count)
+    hatching: Vec<(usize, usize, f64)>, // (kind, slot, hatch_at)
+}
+
+fn save_path() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        let dir = std::path::Path::new(&home).join("Library/Application Support/EggStealer");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return dir.join("save.json");
+        }
+    }
+    std::path::PathBuf::from("eggstealer_save.json")
+}
+
+fn load_save() -> Option<SaveData> {
+    let text = std::fs::read_to_string(save_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn spawn_hatching(commands: &mut Commands, game: &Game, kind: usize, slot: usize, hatch_at: f64) {
+    let pos = slot_pos(slot);
+    commands.spawn((
+        Mesh3d(game.egg_mesh.clone()),
+        MeshMaterial3d(game.egg_mats[kind].clone()),
+        Transform::from_xyz(pos.x, 0.36, pos.z)
+            .with_scale(Vec3::splat(0.55))
+            .with_rotation(Quat::from_rotation_y(fastrand::f32() * TAU)),
+        Hatching {
+            kind,
+            slot,
+            hatch_at,
+        },
+    ));
+}
+
+fn panel_colors(tier: usize) -> (Color, LinearRgba) {
+    let (r, g, b) = T_RGB[tier];
+    (Color::srgb(r, g, b), LinearRgba::rgb(r * 2.5, g * 2.5, b * 2.5))
+}
+
+// ---------- tiny 5x7 pixel font for in-world signs ----------
+
+fn glyph(c: char) -> [&'static str; 7] {
+    match c.to_ascii_uppercase() {
+        'A' => ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+        'B' => ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
+        'C' => ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
+        'D' => ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+        'E' => ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+        'F' => ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+        'G' => ["01110", "10001", "10000", "10111", "10001", "10001", "01111"],
+        'H' => ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
+        'I' => ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+        'J' => ["00111", "00010", "00010", "00010", "00010", "10010", "01100"],
+        'K' => ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
+        'L' => ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+        'M' => ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+        'N' => ["10001", "10001", "11001", "10101", "10011", "10001", "10001"],
+        'O' => ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+        'P' => ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+        'Q' => ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
+        'R' => ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+        'S' => ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+        'T' => ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+        'U' => ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+        'V' => ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
+        'W' => ["10001", "10001", "10001", "10101", "10101", "10101", "01010"],
+        'X' => ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+        'Y' => ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+        'Z' => ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+        '0' => ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
+        '1' => ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
+        '2' => ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
+        '3' => ["11110", "00001", "00001", "01110", "00001", "00001", "11110"],
+        '4' => ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
+        '5' => ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
+        '6' => ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
+        '7' => ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
+        '8' => ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
+        '9' => ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
+        '.' => ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
+        ',' => ["00000", "00000", "00000", "00000", "01100", "00100", "01000"],
+        '!' => ["00100", "00100", "00100", "00100", "00100", "00000", "00100"],
+        '-' => ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+        '/' => ["00001", "00010", "00010", "00100", "01000", "01000", "10000"],
+        '\'' => ["00100", "00100", "01000", "00000", "00000", "00000", "00000"],
+        ':' => ["00000", "01100", "01100", "00000", "01100", "01100", "00000"],
+        _ => ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+    }
+}
+
+// Render centred lines of text into an RGBA image. Returns the handle and its pixel size.
+fn text_image(
+    images: &mut Assets<Image>,
+    lines: &[&str],
+    scale: u32,
+    pad: u32,
+    fg: [u8; 4],
+    bg: [u8; 4],
+) -> (Handle<Image>, u32, u32) {
+    let cols = lines.iter().map(|l| l.chars().count() as u32).max().unwrap_or(1);
+    let w = cols * 6 * scale + 2 * pad;
+    let h = lines.len() as u32 * 9 * scale + 2 * pad;
+    let mut px = vec![bg; (w * h) as usize];
+    for (li, line) in lines.iter().enumerate() {
+        let n = line.chars().count() as u32;
+        let x_off = pad + (cols - n) * 3 * scale;
+        let y_off = pad + li as u32 * 9 * scale + scale;
+        for (ci, c) in line.chars().enumerate() {
+            let g = glyph(c);
+            for (gy, row) in g.iter().enumerate() {
+                for (gx, bit) in row.bytes().enumerate() {
+                    if bit != b'1' {
+                        continue;
+                    }
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            let x = x_off + (ci as u32 * 6 + gx as u32) * scale + dx;
+                            let y = y_off + gy as u32 * scale + dy;
+                            px[(y * w + x) as usize] = fg;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let handle = make_image(images, w, h, false, |x, y| px[(y * w + x) as usize]);
+    (handle, w, h)
+}
+
+// EGG_SCREENSHOT=1 starts straight into the world with no HUD or menu (for taking the menu picture)
+#[derive(Resource)]
+struct PhotoMode(bool);
 
 fn main() {
     App::new()
+        .insert_resource(PhotoMode(std::env::var("EGG_SCREENSHOT").is_ok()))
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Egg Stealer 3D".to_string(),
-                resolution: (1280.0, 800.0).into(),
+                resolution: Vec2::new(1280.0, 800.0).into(),
                 ..default()
             }),
             ..default()
         }))
         .insert_resource(ClearColor(Color::srgb(0.54, 0.74, 0.94)))
         .insert_resource(AmbientLight {
-            color: Color::srgb(0.75, 0.82, 1.0),
-            brightness: 480.0,
+            color: Color::srgb(0.86, 0.88, 0.94),
+            brightness: 320.0,
             ..default()
         })
-        .add_systems(Startup, setup)
+        .insert_resource(DirectionalLightShadowMap { size: 4096 })
+        .add_systems(Startup, (setup, set_dock_icon))
         .add_systems(
             Update,
             (
-                cursor_grab,
-                player_look,
-                player_move,
-                gameplay,
+                (
+                    cursor_grab,
+                    player_look,
+                    player_move,
+                    select_slot,
+                    gameplay,
+                    held_egg,
+                    gear_system,
+                    portal_system,
+                    portal_menu,
+                    world_buttons,
+                )
+                    .run_if(playing),
+                main_menu,
+                pause_menu,
+                day_night,
                 monsters_ai,
-                hatch_and_pets,
-                portal_system,
-                portal_menu,
-                world_buttons,
+                hatching,
                 animate,
                 hud,
             ),
         )
+        .add_systems(Last, save_system)
         .run();
 }
+
+// Dock icon (macOS). Running through `cargo run` gives a generic executable icon,
+// so hand AppKit our own image once the window exists. The NonSend parameter pins
+// this system to the main thread, which AppKit requires.
+#[cfg(target_os = "macos")]
+fn set_dock_icon(_windows: NonSend<bevy::winit::WinitWindows>) {
+    use objc2::ClassType;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::{MainThreadMarker, NSData};
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let data = NSData::with_bytes(include_bytes!("../assets/icon.png"));
+    if let Some(img) = NSImage::initWithData(NSImage::alloc(), &data) {
+        unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&img)) };
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_icon() {}
 
 // ---------- procedural textures ----------
 
@@ -306,26 +771,68 @@ fn make_image(
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     );
-    if repeat {
-        img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-            address_mode_u: ImageAddressMode::Repeat,
-            address_mode_v: ImageAddressMode::Repeat,
-            ..ImageSamplerDescriptor::default()
-        });
-    }
+    let mode = if repeat {
+        ImageAddressMode::Repeat
+    } else {
+        ImageAddressMode::ClampToEdge
+    };
+    img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: mode,
+        address_mode_v: mode,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        ..ImageSamplerDescriptor::default()
+    });
     images.add(img)
 }
 
+// Smooth value noise on a `cell`-pixel lattice that tiles at 256 px.
+fn vnoise(x: u32, y: u32, cell: u32, seed: u32) -> f32 {
+    let n = 256 / cell;
+    let fx = (x % cell) as f32 / cell as f32;
+    let fy = (y % cell) as f32 / cell as f32;
+    let (cx, cy) = (x / cell, y / cell);
+    let v = |i: u32, j: u32| (hash2(i % n, j % n, seed) % 1000) as f32 / 1000.0;
+    let (a, b, c, d) = (v(cx, cy), v(cx + 1, cy), v(cx, cy + 1), v(cx + 1, cy + 1));
+    let sx = fx * fx * (3.0 - 2.0 * fx);
+    let sy = fy * fy * (3.0 - 2.0 * fy);
+    let top = a + (b - a) * sx;
+    let bot = c + (d - c) * sx;
+    top + (bot - top) * sy
+}
+
 fn grass_pixel(x: u32, y: u32) -> [u8; 4] {
-    let n = (hash2(x, y, 7) % 31) as i32 - 15;
-    let patch = (hash2(x / 16, y / 16, 21) % 17) as i32 - 8;
-    let blade = hash2(x, y, 99) % 97 < 5;
-    let (mut r, mut g, mut b) = (58 + n + patch, 96 + n + patch, 40 + n / 2 + patch);
+    let big = vnoise(x, y, 64, 21) - 0.5;
+    let mid = vnoise(x, y, 16, 23) - 0.5;
+    let fine = (hash2(x, y, 7) % 41) as f32 / 41.0 - 0.5;
+    let shade = big * 0.30 + mid * 0.22 + fine * 0.16;
+    // worn, yellowish patches
+    let dry = (vnoise(x, y, 32, 29) - 0.55).max(0.0) * 1.6;
+    let blade = hash2(x, y, 99) % 53 < 2;
+    let mut r = 72.0 + shade * 90.0 + dry * 60.0;
+    let mut g = 102.0 + shade * 110.0 + dry * 34.0;
+    let mut b = 38.0 + shade * 50.0;
     if blade {
-        r += 22;
-        g += 34;
-        b += 12;
+        r += 24.0;
+        g += 38.0;
+        b += 10.0;
     }
+    [
+        r.clamp(0.0, 255.0) as u8,
+        g.clamp(0.0, 255.0) as u8,
+        b.clamp(0.0, 255.0) as u8,
+        255,
+    ]
+}
+
+fn wood_pixel(x: u32, y: u32) -> [u8; 4] {
+    let wobble = vnoise(x, y, 32, 31) * 6.0 + (y as f32 * 0.07).sin() * 2.5;
+    let ring = ((x as f32 * 0.42 + wobble).sin() * 0.5 + 0.5) * 34.0;
+    let grain = (hash2(x, y, 17) % 13) as i32 - 6;
+    let r = (120.0 + ring) as i32 + grain;
+    let g = (86.0 + ring * 0.8) as i32 + grain;
+    let b = (52.0 + ring * 0.5) as i32 + grain / 2;
     [
         r.clamp(0, 255) as u8,
         g.clamp(0, 255) as u8,
@@ -544,6 +1051,7 @@ fn spawn_world_egg(commands: &mut Commands, game: &Game, x: f32, z: f32, kind: u
 
 fn setup(
     mut commands: Commands,
+    photo_mode: Res<PhotoMode>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -557,7 +1065,8 @@ fn setup(
     );
 
     // --- textures & shared materials ---
-    let grass_tex = make_image(&mut images, 128, 128, true, grass_pixel);
+    let grass_tex = make_image(&mut images, 256, 256, true, grass_pixel);
+    let wood_tex = make_image(&mut images, 128, 128, true, wood_pixel);
     let stone_tex = make_image(&mut images, 128, 128, true, stone_pixel);
     let belt_tex = make_image(&mut images, 64, 64, true, belt_pixel);
 
@@ -565,14 +1074,14 @@ fn setup(
         base_color: Color::srgb(1.0, 1.0, 1.0),
         base_color_texture: Some(grass_tex.clone()),
         perceptual_roughness: 0.95,
-        uv_transform: Affine2::from_scale(Vec2::new(30.0, 44.0)),
+        uv_transform: Affine2::from_scale(Vec2::new(16.0, 31.0)),
         ..default()
     });
     let zone_grass = materials.add(StandardMaterial {
         base_color: Color::srgb(0.78, 0.82, 0.78),
         base_color_texture: Some(grass_tex.clone()),
         perceptual_roughness: 0.95,
-        uv_transform: Affine2::from_scale(Vec2::new(44.0, 44.0)),
+        uv_transform: Affine2::from_scale(Vec2::new(21.0, 31.0)),
         ..default()
     });
     let stone_x = materials.add(StandardMaterial {
@@ -588,24 +1097,15 @@ fn setup(
         ..default()
     });
     let wood = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.48, 0.33, 0.18),
-        perceptual_roughness: 0.9,
+        base_color: Color::srgb(0.85, 0.78, 0.7),
+        base_color_texture: Some(wood_tex),
+        perceptual_roughness: 0.85,
         ..default()
     });
     let white_line = materials.add(StandardMaterial {
         base_color: Color::srgb(1.0, 1.0, 1.0),
         emissive: LinearRgba::rgb(0.6, 0.6, 0.6),
         perceptual_roughness: 0.8,
-        ..default()
-    });
-    let bush_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.16, 0.34, 0.14),
-        perceptual_roughness: 1.0,
-        ..default()
-    });
-    let rock_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.45, 0.44, 0.42),
-        perceptual_roughness: 0.95,
         ..default()
     });
 
@@ -656,6 +1156,37 @@ fn setup(
         Transform::from_xyz(LINE_X, 0.02, WORLD_Z / 2.0),
     ));
 
+    // --- sky dome + sun disc ---
+    let sky_mesh = meshes.add(sky_dome_mesh(1, false));
+    commands.spawn((
+        Mesh3d(sky_mesh.clone()),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            unlit: true,
+            fog_enabled: false,
+            cull_mode: None,
+            double_sided: true,
+            ..default()
+        })),
+        Transform::from_translation(SKY_CENTER),
+        NotShadowCaster,
+        NotShadowReceiver,
+    ));
+    let t1 = theme(1, false);
+    let sun_mat = materials.add(StandardMaterial {
+        base_color: Color::BLACK,
+        emissive: LinearRgba::rgb(t1.disc.0, t1.disc.1, t1.disc.2),
+        fog_enabled: false,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(unit_sphere.clone()),
+        MeshMaterial3d(sun_mat.clone()),
+        Transform::from_translation(SKY_CENTER - sun_dir() * 700.0).with_scale(Vec3::splat(24.0)),
+        NotShadowCaster,
+        NotShadowReceiver,
+    ));
+
     // --- stone walls ---
     let wall_h = 4.5;
     for (size, pos, mat) in [
@@ -691,10 +1222,10 @@ fn setup(
     for yi in 0..4 {
         let x0 = 13.0;
         let x1 = 43.0;
-        let z0 = 12.0 + yi as f32 * 35.0;
+        let z0 = YARD.2 + yi as f32 * YARD_GAP;
         let z1 = z0 + 25.0;
         let post = meshes.add(Cuboid::new(0.14, 1.25, 0.14));
-        let mut spawn_post = |x: f32, z: f32, commands: &mut Commands| {
+        let spawn_post = |x: f32, z: f32, commands: &mut Commands| {
             commands.spawn((
                 Mesh3d(post.clone()),
                 MeshMaterial3d(wood.clone()),
@@ -746,7 +1277,7 @@ fn setup(
         }
     }
 
-    // --- treadmills (yours is functional, other yards get dirt ones) ---
+    // --- treadmills, one per yard, all functional ---
     let belt_mat = materials.add(StandardMaterial {
         base_color_texture: Some(belt_tex.clone()),
         perceptual_roughness: 0.6,
@@ -766,80 +1297,149 @@ fn setup(
         ..default()
     });
     for yi in 0..4 {
-        let c = Vec3::new(46.6, 0.0, 24.5 + yi as f32 * 35.0);
+        let c = treadmill_center(yi);
+        let hl = TM_BELT_L / 2.0 + 0.1;
+        let hw = TM_BELT_W / 2.0;
         // belt
         commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(2.6, 0.14, 1.3))),
+            Mesh3d(meshes.add(Cuboid::new(TM_BELT_L, 0.14, TM_BELT_W))),
             MeshMaterial3d(belt_mat.clone()),
-            Transform::from_xyz(c.x, 0.2, c.z),
+            Transform::from_xyz(c.x, TM_DECK_H - 0.07, c.z),
         ));
         // side frames
-        for dz in [-0.72, 0.72] {
+        for side in [-1.0, 1.0] {
             commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(2.8, 0.3, 0.12))),
+                Mesh3d(meshes.add(Cuboid::new(hl * 2.0, 0.3, 0.12))),
                 MeshMaterial3d(frame_mat.clone()),
-                Transform::from_xyz(c.x, 0.16, c.z + dz),
+                Transform::from_xyz(c.x, 0.16, c.z + side * (hw + 0.06)),
             ));
         }
         // console post + panel (west end, facing the yard)
         commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(0.12, 1.15, 1.3))),
+            Mesh3d(meshes.add(Cuboid::new(0.22, 1.15, TM_BELT_W + 0.24))),
             MeshMaterial3d(frame_mat.clone()),
-            Transform::from_xyz(c.x - 1.35, 0.6, c.z),
+            Transform::from_xyz(c.x - hl - 0.05, 0.6, c.z),
         ));
         commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(0.08, 0.5, 0.95))),
-            MeshMaterial3d(if yi == 0 {
-                panel_mat.clone()
-            } else {
-                materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.45, 0.32, 0.18),
-                    ..default()
-                })
-            }),
-            Transform::from_xyz(c.x - 1.42, 1.05, c.z),
+            Mesh3d(meshes.add(Cuboid::new(0.08, 0.5, 1.2))),
+            MeshMaterial3d(panel_mat.clone()),
+            Transform::from_xyz(c.x - hl - 0.2, 1.05, c.z),
         ));
     }
 
-    // --- bushes & rocks ---
-    for _ in 0..26 {
-        let x = 5.0 + fastrand::f32() * (WORLD_X - 10.0);
-        let z = 5.0 + fastrand::f32() * (WORLD_Z - 10.0);
-        // keep clear of yards/treadmills/spawn/line
-        if x > 8.0 && x < 52.0 && z > 8.0 && z < 146.0 {
-            continue;
-        }
-        if (x - LINE_X).abs() < 4.0 {
-            continue;
-        }
-        let s = 0.8 + fastrand::f32() * 0.9;
+    // --- gear station / upgrader, one per yard ---
+    let kiosk_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.16, 0.18, 0.24),
+        perceptual_roughness: 0.45,
+        metallic: 0.5,
+        ..default()
+    });
+    let kiosk_top = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.30, 0.65, 0.95),
+        emissive: LinearRgba::rgb(0.3, 0.9, 1.6),
+        perceptual_roughness: 0.3,
+        ..default()
+    });
+    let (sign_tex, sw, sh) = text_image(
+        &mut images,
+        &["GEAR STATION / UPGRADER"],
+        6,
+        24,
+        [255, 255, 255, 255],
+        [18, 30, 70, 255],
+    );
+    let sign_w = 4.4;
+    let sign_h = sign_w * sh as f32 / sw as f32;
+    let sign_mesh = meshes.add(Rectangle::new(sign_w, sign_h));
+    let sign_mat = materials.add(StandardMaterial {
+        base_color_texture: Some(sign_tex),
+        unlit: true,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    });
+    for yi in 0..4 {
+        let g = gear_pos(yi);
         commands.spawn((
-            Mesh3d(unit_sphere.clone()),
-            MeshMaterial3d(bush_mat.clone()),
-            Transform::from_xyz(x, s * 0.45, z).with_scale(Vec3::new(s * 1.3, s * 0.7, s * 1.3)),
+            Mesh3d(unit_cube.clone()),
+            MeshMaterial3d(kiosk_mat.clone()),
+            Transform::from_xyz(g.x, 0.55, g.z).with_scale(Vec3::new(2.2, 1.1, 1.8)),
         ));
         commands.spawn((
-            Mesh3d(unit_sphere.clone()),
-            MeshMaterial3d(bush_mat.clone()),
-            Transform::from_xyz(x + s * 0.7, s * 0.35, z + s * 0.3)
-                .with_scale(Vec3::new(s * 0.8, s * 0.5, s * 0.8)),
+            Mesh3d(unit_cube.clone()),
+            MeshMaterial3d(kiosk_top.clone()),
+            Transform::from_xyz(g.x, 1.14, g.z).with_scale(Vec3::new(2.3, 0.08, 1.9)),
+        ));
+        // sign post + sign on top
+        commands.spawn((
+            Mesh3d(unit_cube.clone()),
+            MeshMaterial3d(kiosk_mat.clone()),
+            Transform::from_xyz(g.x, 1.9, g.z).with_scale(Vec3::new(0.12, 1.6, 0.12)),
+        ));
+        commands.spawn((
+            Mesh3d(sign_mesh.clone()),
+            MeshMaterial3d(sign_mat.clone()),
+            Transform::from_xyz(g.x, 2.7 + sign_h / 2.0, g.z)
+                .with_rotation(Quat::from_rotation_y(PI / 2.0)),
+            NotShadowCaster,
         ));
     }
-    for _ in 0..10 {
-        let x = 8.0 + fastrand::f32() * (WORLD_X - 16.0);
-        let z = 8.0 + fastrand::f32() * (WORLD_Z - 16.0);
-        if (x - LINE_X).abs() < 4.0 {
-            continue;
-        }
-        let s = 0.35 + fastrand::f32() * 0.6;
-        commands.spawn((
-            Mesh3d(unit_sphere.clone()),
-            MeshMaterial3d(rock_mat.clone()),
-            Transform::from_xyz(x, s * 0.4, z)
-                .with_scale(Vec3::new(s * 1.4, s * 0.6, s))
-                .with_rotation(Quat::from_rotation_y(fastrand::f32() * TAU)),
-        ));
-    }
+
+    // --- night wall along the line (hidden by day) ---
+    let (wall_tex, ww, wh) = text_image(
+        &mut images,
+        &["IT IS NIGHT TIME.", "YOU CANNOT GO OUT THERE."],
+        5,
+        16,
+        [255, 235, 235, 255],
+        [120, 0, 0, 255],
+    );
+    let wall_text_mat = materials.add(StandardMaterial {
+        base_color_texture: Some(wall_tex),
+        unlit: true,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    });
+    let panel_w = 12.0;
+    let panel_h = panel_w * wh as f32 / ww as f32;
+    let panel_mesh = meshes.add(Rectangle::new(panel_w, panel_h));
+    commands
+        .spawn((
+            Mesh3d(meshes.add(Cuboid::new(0.3, 6.0, WORLD_Z))),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: Color::srgba(0.9, 0.05, 0.05, 0.45),
+                emissive: LinearRgba::rgb(1.6, 0.05, 0.05),
+                alpha_mode: AlphaMode::Blend,
+                double_sided: true,
+                cull_mode: None,
+                ..default()
+            })),
+            Transform::from_xyz(LINE_X, 3.0, WORLD_Z / 2.0),
+            Visibility::Hidden,
+            NotShadowCaster,
+            NightWall,
+        ))
+        .with_children(|w| {
+            // warning panels every 20 m along the west face of the wall (local space)
+            let mut z = -WORLD_Z / 2.0 + 10.0;
+            while z < WORLD_Z / 2.0 - 5.0 {
+                w.spawn((
+                    Mesh3d(panel_mesh.clone()),
+                    MeshMaterial3d(wall_text_mat.clone()),
+                    Transform::from_xyz(-0.2, 0.4, z).with_rotation(Quat::from_rotation_y(-PI / 2.0)),
+                    NotShadowCaster,
+                ));
+                z += 20.0;
+            }
+        });
+    let ice_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.65, 0.85, 1.0, 0.55),
+        emissive: LinearRgba::rgb(0.1, 0.25, 0.4),
+        alpha_mode: AlphaMode::Blend,
+        perceptual_roughness: 0.1,
+        ..default()
+    });
 
     // --- monsters ---
     let eye_open = materials.add(StandardMaterial {
@@ -875,11 +1475,11 @@ fn setup(
         [v, v, v, 255]
     });
     let monster_defs: [(Vec3, f32, f32, (f32, f32, f32)); 5] = [
-        (Vec3::new(145.0, 0.0, 35.0), 1.0, 6.5, (0.45, 0.13, 0.13)),
-        (Vec3::new(195.0, 0.0, 28.0), 1.2, 6.2, (0.34, 0.13, 0.42)),
-        (Vec3::new(232.0, 0.0, 80.0), 1.35, 5.8, (0.13, 0.30, 0.15)),
-        (Vec3::new(155.0, 0.0, 115.0), 1.05, 6.8, (0.13, 0.17, 0.34)),
-        (Vec3::new(205.0, 0.0, 128.0), 1.1, 6.0, (0.16, 0.16, 0.18)),
+        (Vec3::new(88.0, 0.0, 28.0), 1.0, 6.5, (0.45, 0.13, 0.13)),
+        (Vec3::new(114.0, 0.0, 23.0), 1.2, 6.2, (0.34, 0.13, 0.42)),
+        (Vec3::new(135.0, 0.0, 64.0), 1.35, 5.8, (0.13, 0.30, 0.15)),
+        (Vec3::new(92.0, 0.0, 92.0), 1.05, 6.8, (0.13, 0.17, 0.34)),
+        (Vec3::new(120.0, 0.0, 103.0), 1.1, 6.0, (0.16, 0.16, 0.18)),
     ];
     for (home, scale, speed, (r, g, b)) in monster_defs {
         let fur_mat = materials.add(StandardMaterial {
@@ -916,6 +1516,7 @@ fn setup(
                     scale,
                     awake: 0.0,
                     phase: fastrand::f32() * TAU,
+                    frozen: 0.0,
                 },
             ))
             .with_children(|p| {
@@ -1007,7 +1608,7 @@ fn setup(
             });
     }
 
-    // --- portal at the back of your yard ---
+    // --- a portal at the back of every yard ---
     let portal_tex = make_image(&mut images, 128, 128, true, |x, y| {
         let dx = x as f32 - 64.0;
         let dy = y as f32 - 64.0;
@@ -1032,50 +1633,44 @@ fn setup(
         metallic: 0.3,
         ..default()
     });
-    commands.spawn((
-        Mesh3d(meshes.add(Torus {
-            minor_radius: 0.25,
-            major_radius: 2.0,
-        })),
-        MeshMaterial3d(ring_mat),
-        Transform::from_xyz(PORTAL_POS.x, 2.3, PORTAL_POS.z)
-            .with_rotation(Quat::from_rotation_z(PI / 2.0)),
-    ));
-    commands.spawn((
-        Mesh3d(meshes.add(Circle::new(1.85))),
-        MeshMaterial3d(portal_mat.clone()),
-        Transform::from_xyz(PORTAL_POS.x, 2.3, PORTAL_POS.z)
-            .with_rotation(Quat::from_rotation_y(PI / 2.0)),
-        PortalDisc,
-    ));
-
-    // --- pet part assets ---
-    let beak_mesh = meshes.add(Cone {
-        radius: 0.07,
-        height: 0.16,
+    let ring_mesh = meshes.add(Torus {
+        minor_radius: 0.25,
+        major_radius: 2.0,
     });
-    let beak_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.6, 0.15),
-        perceptual_roughness: 0.6,
-        ..default()
-    });
-    let black_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.05, 0.05, 0.05),
-        perceptual_roughness: 0.4,
-        ..default()
-    });
+    let disc_mesh = meshes.add(Circle::new(1.85));
+    for yi in 0..4 {
+        let pp = portal_pos(yi);
+        commands.spawn((
+            Mesh3d(ring_mesh.clone()),
+            MeshMaterial3d(ring_mat.clone()),
+            Transform::from_xyz(pp.x, 2.3, pp.z).with_rotation(Quat::from_rotation_z(PI / 2.0)),
+        ));
+        commands.spawn((
+            Mesh3d(disc_mesh.clone()),
+            MeshMaterial3d(portal_mat.clone()),
+            Transform::from_xyz(pp.x, 2.3, pp.z).with_rotation(Quat::from_rotation_y(PI / 2.0)),
+            PortalDisc,
+        ));
+    }
 
     // --- game resource + initial eggs ---
-    let game = Game {
+    let mut game = Game {
+        in_menu: !photo_mode.0,
+        paused: false,
         money: 0.0,
         training: 0.0,
         tier: 0,
-        inventory: Vec::new(),
+        inventory: [None; INV_SLOTS],
+        selected: 0,
+        held_kind: None,
         level: 1,
-        unlocked: [true, false, false],
+        unlocked: {
+            let mut u = [false; N_WORLDS];
+            u[0] = true;
+            u
+        },
         menu_open: false,
         won: false,
-        yard_slots: 0,
         portal_lit: false,
         yard_eggs: Vec::new(),
         msg: "Steal eggs, hatch them into pets, and reach the portal with $1000000!"
@@ -1093,13 +1688,64 @@ fn setup(
         safe_grass_mat: safe_grass.clone(),
         zone_grass_mat: zone_grass.clone(),
         sphere_mesh: unit_sphere.clone(),
-        beak_mesh,
-        beak_mat,
-        black_mat,
         defeat_sound: asset_server.load("defeat.wav"),
         pickup_sound: asset_server.load("pickup.wav"),
         on_treadmill: false,
+        gear: 0,
+        gear_cd: [0.0; 3],
+        night: false,
+        night_applied: None,
+        ice_mat,
+        cube_mesh: unit_cube.clone(),
+        eye_h: EYE,
+        sky_mesh,
+        sun_mat,
     };
+    // --- restore the last session; eggs keep hatching on the wall clock while you are away ---
+    if let Some(sd) = load_save() {
+        game.money = sd.money;
+        game.training = sd.training;
+        game.tier = sd.tier.min(6);
+        game.level = sd.level.clamp(1, N_WORLDS);
+        for (i, u) in sd.unlocked.iter().enumerate().take(N_WORLDS) {
+            game.unlocked[i] = *u;
+        }
+        game.unlocked[0] = true;
+        game.won = sd.won;
+        game.gear = sd.gear.min(3);
+        game.yard_eggs = sd.yard_eggs;
+        for (i, k) in sd.inventory.iter().enumerate().take(INV_SLOTS) {
+            game.inventory[i] = k.filter(|k| *k < 169);
+        }
+        let now = now_unix();
+        let mut hatched_away = 0;
+        let mut away_money = 0.0;
+        for &(kind, slot, at) in sd.hatching.iter().filter(|(k, _, _)| *k < 169) {
+            if at <= now {
+                away_money += hatch_payout(kind, game.level);
+                game.yard_eggs.push(kind);
+                hatched_away += 1;
+            } else {
+                spawn_hatching(&mut commands, &game, kind, slot, at);
+            }
+        }
+        game.money += away_money;
+        if let Some(m) = materials.get_mut(&game.panel_mat) {
+            let (c, e) = panel_colors(game.tier);
+            m.base_color = c;
+            m.emissive = e;
+        }
+        if hatched_away > 0 {
+            game.msg = format!(
+                "Welcome back! {} egg{} hatched while you were away: +${}",
+                hatched_away,
+                if hatched_away == 1 { "" } else { "s" },
+                fmt_money(away_money)
+            );
+            game.msg_color = Color::srgb(0.4, 1.0, 0.5);
+            game.msg_t = 6.0;
+        }
+    }
     for _ in 0..60 {
         let (x, z) = random_egg_xz();
         spawn_world_egg(&mut commands, &game, x, z, random_kind());
@@ -1109,15 +1755,16 @@ fn setup(
     // --- sun, camera, HUD ---
     commands.spawn((
         DirectionalLight {
-            illuminance: 9500.0,
+            illuminance: t1.lux,
             shadows_enabled: true,
-            color: Color::srgb(1.0, 0.96, 0.88),
+            color: Color::srgb(t1.sun.0, t1.sun.1, t1.sun.2),
             ..default()
         },
-        Transform::from_xyz(60.0, 90.0, 20.0).looking_at(Vec3::new(130.0, 0.0, 78.0), Vec3::Y),
+        Transform::from_xyz(SUN_FROM.x, SUN_FROM.y, SUN_FROM.z).looking_at(SUN_AT, Vec3::Y),
         CascadeShadowConfigBuilder {
-            first_cascade_far_bound: 25.0,
-            maximum_distance: 160.0,
+            num_cascades: 4,
+            first_cascade_far_bound: 10.0,
+            maximum_distance: 200.0,
             ..default()
         }
         .build(),
@@ -1125,27 +1772,36 @@ fn setup(
 
     commands.spawn((
         Camera3d::default(),
+        Camera {
+            hdr: true,
+            ..default()
+        },
+        Msaa::Off,
         Projection::from(PerspectiveProjection {
             fov: 75.0_f32.to_radians(),
             ..default()
         }),
         Transform::from_translation(SPAWN)
             .with_rotation(Quat::from_rotation_y(-PI / 2.0)),
-        DistanceFog {
-            color: Color::srgb(0.6, 0.75, 0.92),
-            falloff: FogFalloff::Linear {
-                start: 70.0,
-                end: 260.0,
-            },
-            ..default()
+        fog_for(1, false),
+        ScreenSpaceAmbientOcclusion::default(),
+        Bloom {
+            intensity: 0.06,
+            ..Bloom::NATURAL
         },
+        Fxaa::default(),
         Player {
             yaw: -PI / 2.0,
             pitch: 0.0,
         },
     ));
 
-    // HUD
+    if !photo_mode.0 {
+        spawn_hud(&mut commands, asset_server.load("menu_bg.png"));
+    }
+}
+
+fn spawn_hud(commands: &mut Commands, menu_bg: Handle<Image>) {
     let font = |s: f32| TextFont {
         font_size: s,
         ..default()
@@ -1186,9 +1842,34 @@ fn setup(
         },
         Hud::Stats,
     ));
+    commands.spawn((
+        Text::new(""),
+        font(17.0),
+        TextColor(Color::srgb(0.9, 0.9, 0.75)),
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(16.0),
+            top: Val::Px(36.0),
+            ..default()
+        },
+        Hud::Clock,
+    ));
+    commands.spawn((
+        Text::new(""),
+        font(17.0),
+        TextColor(Color::srgb(0.75, 0.9, 1.0)),
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(16.0),
+            bottom: Val::Px(110.0),
+            ..default()
+        },
+        Hud::Gear,
+    ));
     for (top, size, hud) in [
         (Val::Px(78.0), 20.0, Hud::Carry),
         (Val::Percent(30.0), 26.0, Hud::Msg),
+        (Val::Percent(16.0), 34.0, Hud::Night),
     ] {
         commands
             .spawn(Node {
@@ -1237,7 +1918,7 @@ fn setup(
         },
         BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
     ));
-    // inventory hotbar: 5 free slots
+    // inventory hotbar
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
@@ -1245,15 +1926,15 @@ fn setup(
             right: Val::Px(0.0),
             bottom: Val::Px(58.0),
             justify_content: JustifyContent::Center,
-            column_gap: Val::Px(10.0),
+            column_gap: Val::Px(8.0),
             ..default()
         })
         .with_children(|row| {
-            for i in 0..5 {
+            for i in 0..INV_SLOTS {
                 row.spawn((
                     Node {
-                        width: Val::Px(56.0),
-                        height: Val::Px(56.0),
+                        width: Val::Px(52.0),
+                        height: Val::Px(52.0),
                         border: UiRect::all(Val::Px(2.0)),
                         justify_content: JustifyContent::Center,
                         align_items: AlignItems::Center,
@@ -1277,7 +1958,7 @@ fn setup(
                 });
             }
         });
-    // portal world-select bar (hidden until you step into the portal)
+    // portal world-select bar (hidden until you press E at a portal)
     commands
         .spawn((
             Node {
@@ -1296,20 +1977,24 @@ fn setup(
                 .spawn((
                     Node {
                         padding: UiRect::all(Val::Px(16.0)),
-                        column_gap: Val::Px(14.0),
+                        column_gap: Val::Px(12.0),
+                        row_gap: Val::Px(12.0),
+                        flex_wrap: FlexWrap::Wrap,
+                        justify_content: JustifyContent::Center,
                         align_items: AlignItems::Center,
+                        max_width: Val::Px(5.0 * 168.0 + 4.0 * 12.0 + 32.0),
                         ..default()
                     },
                     BackgroundColor(Color::srgba(0.0, 0.0, 0.05, 0.75)),
                     BorderRadius::all(Val::Px(16.0)),
                 ))
                 .with_children(|bar| {
-                    for w in 1..=3usize {
+                    for w in 1..=N_WORLDS {
                         bar.spawn((
                             Button,
                             Node {
-                                width: Val::Px(210.0),
-                                height: Val::Px(64.0),
+                                width: Val::Px(168.0),
+                                height: Val::Px(58.0),
                                 justify_content: JustifyContent::Center,
                                 align_items: AlignItems::Center,
                                 border: UiRect::all(Val::Px(3.0)),
@@ -1324,7 +2009,7 @@ fn setup(
                             b.spawn((
                                 Text::new(format!("World {}", w)),
                                 TextFont {
-                                    font_size: 19.0,
+                                    font_size: 16.0,
                                     ..default()
                                 },
                                 TextColor(Color::WHITE),
@@ -1334,9 +2019,299 @@ fn setup(
                     }
                 });
         });
+
+    // --- pause menu (Escape) ---
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                top: Val::Px(0.0),
+                bottom: Val::Px(0.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                display: Display::None,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.05, 0.6)),
+            PauseMenu,
+        ))
+        .with_children(|root| {
+            root.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(18.0),
+                padding: UiRect::all(Val::Px(36.0)),
+                ..default()
+            })
+            .with_children(|col| {
+                col.spawn((
+                    Text::new("PAUSED"),
+                    TextFont {
+                        font_size: 56.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(1.0, 0.92, 0.45)),
+                    Node {
+                        margin: UiRect::bottom(Val::Px(24.0)),
+                        ..default()
+                    },
+                ));
+                for (i, label) in ["CONTINUE PLAYING", "QUIT AND SAVE GAME"].iter().enumerate() {
+                    col.spawn((
+                        Button,
+                        Node {
+                            width: Val::Px(400.0),
+                            height: Val::Px(72.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border: UiRect::all(Val::Px(3.0)),
+                            ..default()
+                        },
+                        BorderColor(Color::srgba(1.0, 1.0, 1.0, 0.85)),
+                        BorderRadius::all(Val::Px(14.0)),
+                        BackgroundColor(Color::srgba(0.05, 0.12, 0.25, 0.9)),
+                        PauseButton(i),
+                    ))
+                    .with_children(|b| {
+                        b.spawn((
+                            Text::new(*label),
+                            TextFont {
+                                font_size: 26.0,
+                                ..default()
+                            },
+                            TextColor(Color::WHITE),
+                        ));
+                    });
+                }
+                col.spawn((
+                    Text::new("Your game saves automatically every 15 seconds and when you quit."),
+                    TextFont {
+                        font_size: 17.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgba(1.0, 1.0, 1.0, 0.7)),
+                    Node {
+                        margin: UiRect::top(Val::Px(10.0)),
+                        ..default()
+                    },
+                ));
+            });
+        });
+
+    // --- main menu, on top of everything until you pick a mode ---
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                top: Val::Px(0.0),
+                bottom: Val::Px(0.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            MainMenu,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                ImageNode::new(menu_bg),
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(0.0),
+                    right: Val::Px(0.0),
+                    top: Val::Px(0.0),
+                    bottom: Val::Px(0.0),
+                    ..default()
+                },
+            ));
+            root.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(0.0),
+                    right: Val::Px(0.0),
+                    top: Val::Px(0.0),
+                    bottom: Val::Px(0.0),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.0, 0.0, 0.05, 0.42)),
+            ));
+            root.spawn(Node {
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(18.0),
+                padding: UiRect::all(Val::Px(36.0)),
+                ..default()
+            })
+            .with_children(|col| {
+                col.spawn((
+                    Text::new("EGG STEALER 3D"),
+                    TextFont {
+                        font_size: 72.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(1.0, 0.92, 0.45)),
+                    Node {
+                        margin: UiRect::bottom(Val::Px(30.0)),
+                        ..default()
+                    },
+                ));
+                for (i, label) in ["ONLINE PLAY", "MULTIPLAYER PLAY", "SINGLE PLAYER"]
+                    .iter()
+                    .enumerate()
+                {
+                    col.spawn((
+                        Button,
+                        Node {
+                            width: Val::Px(360.0),
+                            height: Val::Px(72.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            border: UiRect::all(Val::Px(3.0)),
+                            ..default()
+                        },
+                        BorderColor(Color::srgba(1.0, 1.0, 1.0, 0.85)),
+                        BorderRadius::all(Val::Px(14.0)),
+                        BackgroundColor(Color::srgba(0.05, 0.12, 0.25, 0.9)),
+                        MenuButton(i),
+                    ))
+                    .with_children(|b| {
+                        b.spawn((
+                            Text::new(*label),
+                            TextFont {
+                                font_size: 28.0,
+                                ..default()
+                            },
+                            TextColor(Color::WHITE),
+                        ));
+                    });
+                }
+                col.spawn((
+                    Text::new(""),
+                    TextFont {
+                        font_size: 20.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(1.0, 0.8, 0.5)),
+                    Node {
+                        margin: UiRect::top(Val::Px(12.0)),
+                        ..default()
+                    },
+                    MenuStatus,
+                ));
+            });
+        });
 }
 
 // ---------- systems ----------
+
+fn playing(game: Res<Game>) -> bool {
+    !game.in_menu && !game.paused
+}
+
+// Escape pauses the game; Continue resumes, Quit saves through the normal exit path
+fn pause_menu(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut game: ResMut<Game>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut root_q: Query<&mut Node, With<PauseMenu>>,
+    mut buttons: Query<
+        (&Interaction, &PauseButton, &mut BackgroundColor),
+        (With<Button>, Changed<Interaction>),
+    >,
+    mut exit: EventWriter<AppExit>,
+) {
+    if game.in_menu {
+        return;
+    }
+    let mut resume = false;
+    let mut open = false;
+    if keys.just_pressed(KeyCode::Escape) {
+        if game.paused {
+            resume = true;
+        } else if !game.menu_open {
+            open = true;
+        }
+    }
+    if game.paused {
+        for (interaction, pb, mut bg) in buttons.iter_mut() {
+            match *interaction {
+                Interaction::Pressed => {
+                    if pb.0 == 0 {
+                        resume = true;
+                    } else {
+                        exit.write(AppExit::Success);
+                    }
+                }
+                Interaction::Hovered => bg.0 = Color::srgba(0.15, 0.32, 0.55, 0.95),
+                Interaction::None => bg.0 = Color::srgba(0.05, 0.12, 0.25, 0.9),
+            }
+        }
+    }
+    if open {
+        game.paused = true;
+        for mut node in root_q.iter_mut() {
+            node.display = Display::Flex;
+        }
+        if let Ok(mut window) = windows.single_mut() {
+            window.cursor_options.grab_mode = CursorGrabMode::None;
+            window.cursor_options.visible = true;
+        }
+    } else if resume {
+        game.paused = false;
+        for mut node in root_q.iter_mut() {
+            node.display = Display::None;
+        }
+        if let Ok(mut window) = windows.single_mut() {
+            window.cursor_options.grab_mode = CursorGrabMode::Locked;
+            window.cursor_options.visible = false;
+        }
+    }
+}
+
+fn main_menu(
+    mut game: ResMut<Game>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut root_q: Query<&mut Node, With<MainMenu>>,
+    mut buttons: Query<
+        (&Interaction, &MenuButton, &mut BackgroundColor),
+        (With<Button>, Changed<Interaction>),
+    >,
+    mut status: Query<&mut Text, With<MenuStatus>>,
+) {
+    if !game.in_menu {
+        return;
+    }
+    for (interaction, mb, mut bg) in buttons.iter_mut() {
+        match *interaction {
+            Interaction::Pressed => {
+                if mb.0 == 2 {
+                    game.in_menu = false;
+                    for mut node in root_q.iter_mut() {
+                        node.display = Display::None;
+                    }
+                    if let Ok(mut window) = windows.single_mut() {
+                        window.cursor_options.grab_mode = CursorGrabMode::Locked;
+                        window.cursor_options.visible = false;
+                    }
+                    game.msg = "Steal eggs, hatch them for money, and unlock all 10 worlds!"
+                        .to_string();
+                    game.msg_color = Color::srgb(1.0, 0.95, 0.6);
+                    game.msg_t = 6.0;
+                } else {
+                    let what = if mb.0 == 0 { "Online play" } else { "Multiplayer play" };
+                    for mut t in status.iter_mut() {
+                        t.0 = format!("{} is coming soon! Pick Single Player for now.", what);
+                    }
+                }
+            }
+            Interaction::Hovered => bg.0 = Color::srgba(0.15, 0.32, 0.55, 0.95),
+            Interaction::None => bg.0 = Color::srgba(0.05, 0.12, 0.25, 0.9),
+        }
+    }
+}
 
 fn cursor_grab(
     game: Res<Game>,
@@ -1381,7 +2356,7 @@ fn player_look(
 
 fn player_speed(game: &Game) -> f32 {
     let mut s = 4.2 + game.training * 0.06;
-    if !game.inventory.is_empty() {
+    if game.has_eggs() {
         s *= 0.92;
     }
     s
@@ -1413,51 +2388,89 @@ fn player_move(
         dir -= right;
     }
     let moving = dir.length_squared() > 0.0;
-    let old = tf.translation;
-    if moving {
-        tf.translation += dir.normalize() * player_speed(&game) * dt;
+    let delta = if moving {
+        dir.normalize() * player_speed(&game) * dt
+    } else {
+        Vec3::ZERO
+    };
+    let old_x = tf.translation.x;
+    move_blocked(&mut tf.translation, delta, &blockers());
+    // at night the line is sealed: you can always come home, but not go out
+    let wall_x = LINE_X - PLAYER_RADIUS - 0.25;
+    if game.night && old_x < LINE_X && tf.translation.x > wall_x {
+        tf.translation.x = wall_x;
     }
-    tf.translation.x = tf.translation.x.clamp(4.0, WORLD_X - 4.0);
-    tf.translation.z = tf.translation.z.clamp(4.0, WORLD_Z - 4.0);
-    // solid fences: you can only get into a yard through its gate
-    let r = 0.4;
-    for s in fence_segments() {
-        if s.vertical {
-            let crossed = (old.x - s.line).signum() != (tf.translation.x - s.line).signum()
-                || (tf.translation.x - s.line).abs() < r;
-            if crossed && tf.translation.z > s.a - r && tf.translation.z < s.b + r {
-                let side = (old.x - s.line).signum();
-                if side != 0.0 {
-                    tf.translation.x = s.line + side * r;
-                }
-            }
-        } else {
-            let crossed = (old.z - s.line).signum() != (tf.translation.z - s.line).signum()
-                || (tf.translation.z - s.line).abs() < r;
-            if crossed && tf.translation.x > s.a - r && tf.translation.x < s.b + r {
-                let side = (old.z - s.line).signum();
-                if side != 0.0 {
-                    tf.translation.z = s.line + side * r;
-                }
-            }
-        }
-    }
-    // head bob
-    let t = time.elapsed_secs();
-    tf.translation.y = EYE
-        + if moving {
-            (t * (6.0 + player_speed(&game) * 0.8)).sin() * 0.05
-        } else {
-            0.0
-        };
+    tf.translation.x = tf.translation.x.clamp(0.6, WORLD_X - 0.6);
+    tf.translation.z = tf.translation.z.clamp(0.6, WORLD_Z - 0.6);
 
     // treadmill: stand on it to train - no cap, you can always get faster
     let p = tf.translation;
-    game.on_treadmill =
-        (p.x - TM_CENTER.x).abs() < 1.5 && (p.z - TM_CENTER.z).abs() < 0.95;
+    game.on_treadmill = on_deck(p);
     if game.on_treadmill {
         game.training += dt * T_MULT[game.tier] * 0.5;
     }
+
+    // eye height: the belt deck is raised, so ease up/down when stepping on or off
+    let target = EYE + if on_deck(p) { TM_DECK_H } else { 0.0 };
+    game.eye_h += (target - game.eye_h) * (dt * 14.0).min(1.0);
+    // head bob
+    let t = time.elapsed_secs();
+    tf.translation.y = game.eye_h
+        + if moving {
+            (t * (5.0 + player_speed(&game) * 0.6)).sin() * 0.035
+        } else {
+            0.0
+        };
+}
+
+// number keys 1-9 and 0 select inventory slots 1-10
+fn select_slot(keys: Res<ButtonInput<KeyCode>>, mut game: ResMut<Game>) {
+    const KEYS: [KeyCode; INV_SLOTS] = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+        KeyCode::Digit0,
+    ];
+    for (i, k) in KEYS.iter().enumerate() {
+        if keys.just_pressed(*k) {
+            game.selected = i;
+        }
+    }
+}
+
+// keep the egg shown in your hand in sync with the selected slot
+fn held_egg(
+    mut commands: Commands,
+    mut game: ResMut<Game>,
+    player_q: Query<Entity, With<Player>>,
+    carried_q: Query<Entity, With<CarriedEgg>>,
+) {
+    let want = game.inventory[game.selected];
+    if want == game.held_kind {
+        return;
+    }
+    for e in carried_q.iter() {
+        commands.entity(e).despawn();
+    }
+    if let (Some(kind), Ok(player)) = (want, player_q.single()) {
+        let mesh = game.egg_mesh.clone();
+        let mat = game.egg_mats[kind].clone();
+        commands.entity(player).with_children(|c| {
+            c.spawn((
+                Mesh3d(mesh),
+                MeshMaterial3d(mat),
+                Transform::from_xyz(0.40, -0.36, -0.78).with_scale(Vec3::splat(0.36)),
+                CarriedEgg,
+            ));
+        });
+    }
+    game.held_kind = want;
 }
 
 fn gameplay(
@@ -1468,20 +2481,20 @@ fn gameplay(
     mut materials: ResMut<Assets<StandardMaterial>>,
     player_q: Query<(Entity, &Transform), With<Player>>,
     eggs_q: Query<(Entity, &WorldEgg, &Transform)>,
-    carried_q: Query<Entity, With<CarriedEgg>>,
+    hatching_q: Query<&Hatching>,
 ) {
-    let Ok((player_ent, ptf)) = player_q.single() else {
+    let Ok((_player_ent, ptf)) = player_q.single() else {
         return;
     };
     let dt = time.delta_secs();
     let p = ptf.translation;
 
-    // pick up eggs into the 5 inventory slots
-    if game.inventory.len() < 5 {
+    // pick up eggs into the inventory slots (selected slot first)
+    if game.free_slot().is_some() {
         for (ent, egg, etf) in eggs_q.iter() {
-            if game.inventory.len() >= 5 {
+            let Some(slot) = game.free_slot() else {
                 break;
-            }
+            };
             let d = (etf.translation - p).xz().length();
             if d < 1.5 {
                 commands.entity(ent).despawn();
@@ -1489,77 +2502,70 @@ fn gameplay(
                     AudioPlayer::new(game.pickup_sound.clone()),
                     PlaybackSettings::DESPAWN,
                 ));
-                let slot = game.inventory.len();
-                game.inventory.push(egg.kind);
+                game.inventory[slot] = Some(egg.kind);
                 let (rn, rc) = rarity(egg.kind);
                 game.msg = format!(
-                    "Stole a {} {}! ({}/5)",
+                    "Stole a {} {}! ({}/{})",
                     rn,
                     egg_name(egg.kind),
-                    game.inventory.len()
+                    game.carrying(),
+                    INV_SLOTS
                 );
                 game.msg_color = rc;
                 game.msg_t = 2.5;
-                let mesh = game.egg_mesh.clone();
-                let mat = game.egg_mats[egg.kind].clone();
-                commands.entity(player_ent).with_children(|c| {
-                    c.spawn((
-                        Mesh3d(mesh),
-                        MeshMaterial3d(mat),
-                        Transform::from_xyz(-0.44 + slot as f32 * 0.22, -0.34, -0.8)
-                            .with_scale(Vec3::splat(0.32)),
-                        CarriedEgg { slot },
-                    ));
-                });
             }
         }
     } else if game.msg_t <= 0.0 {
         for (_, _, etf) in eggs_q.iter() {
             if (etf.translation - p).xz().length() < 1.5 {
-                game.msg = "All 5 slots full - run home and hatch them!".to_string();
+                game.msg = format!("All {} slots full - run home and hatch them!", INV_SLOTS);
                 game.msg_color = Color::srgb(1.0, 0.9, 0.4);
                 game.msg_t = 2.0;
                 break;
             }
         }
     }
-
     // deposit in your yard -> eggs start hatching into pets
-    if !game.inventory.is_empty() && p.x > YARD.0 && p.x < YARD.1 && p.z > YARD.2 && p.z < YARD.3
-    {
-        for e in carried_q.iter() {
-            commands.entity(e).despawn();
-        }
+    if game.has_eggs() && p.x > YARD.0 && p.x < YARD.1 && p.z > YARD.2 && p.z < YARD.3 {
         let mult = level_mult(game.level);
         let mut bonus = 0.0;
-        let n = game.inventory.len();
-        let inv: Vec<usize> = game.inventory.drain(..).collect();
+        let inv = game.take_all();
+        let n = inv.len();
+        let now = now_unix();
+        let mut soonest = f64::MAX;
+        let mut occupied = [false; YARD_MAX_SLOTS];
+        for h in hatching_q.iter() {
+            if h.slot < YARD_MAX_SLOTS {
+                occupied[h.slot] = true;
+            }
+        }
         for k in inv {
             bonus += egg_value(k) * 10.0 * mult;
-            game.yard_eggs.push(k);
-            let slot = game.yard_slots;
-            if slot < 48 {
-                game.yard_slots += 1;
-                let (col, row) = (slot % 8, slot / 8);
-                commands.spawn((
-                    Mesh3d(game.egg_mesh.clone()),
-                    MeshMaterial3d(game.egg_mats[k].clone()),
-                    Transform::from_xyz(15.5 + col as f32 * 3.5, 0.36, 14.5 + row as f32 * 3.6)
-                        .with_scale(Vec3::splat(0.55))
-                        .with_rotation(Quat::from_rotation_y(fastrand::f32() * TAU)),
-                    Hatching {
-                        kind: k,
-                        t: 2.5 + fastrand::f32() * 3.0,
-                    },
-                ));
+            match occupied.iter().position(|o| !o) {
+                Some(slot) => {
+                    occupied[slot] = true;
+                    let wait = hatch_secs(k);
+                    soonest = soonest.min(wait);
+                    spawn_hatching(&mut commands, &game, k, slot, now + wait);
+                }
+                None => {
+                    // no room left in the yard: cash it in right away
+                    bonus += hatch_payout(k, game.level);
+                    game.yard_eggs.push(k);
+                }
             }
         }
         game.money += bonus;
         game.msg = format!(
-            "+${} - {} egg{} hatching in your yard!",
+            "+${} - {} egg{} hatching in your yard{}",
             bonus as u64,
             n,
-            if n == 1 { " is" } else { "s are" }
+            if n == 1 { " is" } else { "s are" },
+            if soonest < f64::MAX {
+                format!(" (first one in {})", fmt_dur(soonest))
+            } else {
+                String::new()
+            }
         );
         game.msg_color = Color::srgb(0.4, 1.0, 0.5);
         game.msg_t = 3.0;
@@ -1567,15 +2573,20 @@ fn gameplay(
 
     // upgrade treadmill
     if keys.just_pressed(KeyCode::KeyE) && game.tier < 6 {
-        if (p - Vec3::new(TM_CENTER.x, p.y, TM_CENTER.z)).length() < 4.5 {
+        let near_tm = (0..4).any(|yi| {
+            let c = treadmill_center(yi);
+            (p - Vec3::new(c.x, p.y, c.z)).length() < 4.5
+        });
+        if near_tm {
             let cost = T_COSTS[game.tier + 1];
             if game.money >= cost {
                 game.money -= cost;
                 game.tier += 1;
                 let (r, g, b) = T_RGB[game.tier];
                 if let Some(m) = materials.get_mut(&game.panel_mat) {
-                    m.base_color = Color::srgb(r, g, b);
-                    m.emissive = LinearRgba::rgb(r * 2.5, g * 2.5, b * 2.5);
+                    let (c, e) = panel_colors(game.tier);
+                    m.base_color = c;
+                    m.emissive = e;
                 }
                 game.msg = format!("{} Treadmill unlocked!", T_NAMES[game.tier]);
                 game.msg_color = Color::srgb(r, g, b);
@@ -1592,10 +2603,6 @@ fn gameplay(
         }
     }
 
-    // your pets make money for you
-    let income: f64 = game.yard_eggs.iter().map(|&k| egg_value(k) * 1.5).sum::<f64>()
-        * level_mult(game.level);
-    game.money += income * dt as f64;
 
     // egg respawn
     game.spawn_t -= dt;
@@ -1617,10 +2624,10 @@ fn monsters_ai(
     mut commands: Commands,
     mut game: ResMut<Game>,
     mut player_q: Query<&mut Transform, With<Player>>,
-    mut mq: Query<(&mut Monster, &mut Transform, &Children), Without<Player>>,
+    mut mq: Query<(Entity, &mut Monster, &mut Transform, &Children), Without<Player>>,
+    ice_q: Query<Entity, With<IceBlock>>,
     mut eyes: Query<&mut MeshMaterial3d<StandardMaterial>, With<MonsterEye>>,
     mut limbs: Query<(&mut Transform, &MonsterLimb), (Without<Monster>, Without<Player>)>,
-    carried_q: Query<Entity, With<CarriedEgg>>,
 ) {
     let Ok(mut ptf) = player_q.single_mut() else {
         return;
@@ -1628,10 +2635,33 @@ fn monsters_ai(
     let dt = time.delta_secs();
     let t = time.elapsed_secs();
     let p = ptf.translation;
-    let hunting = !game.inventory.is_empty() && p.x > LINE_X;
+    // monsters hunt anyone carrying eggs, and at night anyone past the line
+    let night = game.night;
+    let hunting = p.x > LINE_X && (game.has_eggs() || night);
     let mut caught = false;
-
-    for (mut m, mut tf, children) in mq.iter_mut() {
+    for (ment, mut m, mut tf, children) in mq.iter_mut() {
+        // frozen solid: no movement, no breathing, no catching
+        let has_ice = children.iter().any(|c| ice_q.get(c).is_ok());
+        if m.frozen > 0.0 {
+            m.frozen -= dt;
+            if !has_ice {
+                commands.entity(ment).with_children(|p| {
+                    p.spawn((
+                        Mesh3d(game.cube_mesh.clone()),
+                        MeshMaterial3d(game.ice_mat.clone()),
+                        Transform::from_xyz(0.0, 1.3, 0.0).with_scale(Vec3::new(2.4, 2.8, 2.4)),
+                        IceBlock,
+                    ));
+                });
+            }
+            continue;
+        } else if has_ice {
+            for c in children.iter() {
+                if ice_q.get(c).is_ok() {
+                    commands.entity(c).despawn();
+                }
+            }
+        }
         let mut walking = 0.0f32;
         if hunting {
             m.awake = (m.awake + dt * 1.5).min(1.0);
@@ -1652,7 +2682,12 @@ fn monsters_ai(
                 }
             }
         } else {
-            m.awake = (m.awake - dt * 1.2).max(0.0);
+            // at night they stay wide awake, pacing at home
+            m.awake = if night {
+                (m.awake + dt * 1.5).min(1.0)
+            } else {
+                (m.awake - dt * 1.2).max(0.0)
+            };
             let mut home = m.home - tf.translation;
             home.y = 0.0;
             let d = home.length();
@@ -1693,11 +2728,8 @@ fn monsters_ai(
         }
     }
 
-    if caught && !game.inventory.is_empty() {
-        for e in carried_q.iter() {
-            commands.entity(e).despawn();
-        }
-        let inv: Vec<usize> = game.inventory.drain(..).collect();
+    if caught {
+        let inv = game.take_all();
         let n = inv.len();
         for kind in inv {
             let (x, z) = random_egg_xz();
@@ -1708,11 +2740,15 @@ fn monsters_ai(
             AudioPlayer::new(game.defeat_sound.clone()),
             PlaybackSettings::DESPAWN,
         ));
-        game.msg = format!(
-            "CAUGHT! The monster took your {} egg{} back!",
-            n,
-            if n == 1 { "" } else { "s" }
-        );
+        game.msg = if n > 0 {
+            format!(
+                "CAUGHT! The monster took your {} egg{} back!",
+                n,
+                if n == 1 { "" } else { "s" }
+            )
+        } else {
+            "CAUGHT! The monster threw you back home!".to_string()
+        };
         game.msg_color = Color::srgb(1.0, 0.25, 0.25);
         game.msg_t = 3.5;
     }
@@ -1722,7 +2758,7 @@ fn animate(
     time: Res<Time>,
     game: Res<Game>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut carried: Query<(&mut Transform, &CarriedEgg), Without<PortalDisc>>,
+    mut carried: Query<&mut Transform, (With<CarriedEgg>, Without<PortalDisc>)>,
     mut portal: Query<&mut Transform, (With<PortalDisc>, Without<CarriedEgg>)>,
 ) {
     let t = time.elapsed_secs();
@@ -1736,11 +2772,10 @@ fn animate(
     if let Some(m) = materials.get_mut(&game.belt_mat) {
         m.uv_transform.translation.x = (m.uv_transform.translation.x + dt * belt_speed) % 1.0;
     }
-    // carried eggs sway in their slots
-    for (mut tf, ce) in carried.iter_mut() {
-        let s = ce.slot as f32;
-        tf.translation = Vec3::new(-0.44 + s * 0.22, -0.34 + (t * 4.0 + s).sin() * 0.012, -0.8);
-        tf.rotation = Quat::from_rotation_y(t * 0.8 + s);
+    // the held egg bobs gently in your hand
+    for mut tf in carried.iter_mut() {
+        tf.translation = Vec3::new(0.40, -0.36 + (t * 4.0).sin() * 0.012, -0.78);
+        tf.rotation = Quat::from_rotation_y(t * 0.8) * Quat::from_rotation_z(0.25);
     }
     // portal vortex spin
     for mut tf in portal.iter_mut() {
@@ -1748,25 +2783,23 @@ fn animate(
     }
 }
 
-fn hatch_and_pets(
+fn hatching(
     time: Res<Time>,
     mut commands: Commands,
-    game: Res<Game>,
-    mut hatching: Query<
-        (Entity, &mut Hatching, &mut Transform),
-        (Without<Pet>, Without<ShellBit>),
-    >,
-    mut pets: Query<(&mut Pet, &mut Transform), (Without<Hatching>, Without<ShellBit>)>,
-    mut bits: Query<(Entity, &mut ShellBit), (Without<Hatching>, Without<Pet>)>,
+    mut game: ResMut<Game>,
+    mut hatching: Query<(Entity, &Hatching, &mut Transform), Without<ShellBit>>,
+    mut bits: Query<(Entity, &mut ShellBit), Without<Hatching>>,
 ) {
     let dt = time.delta_secs();
     let t = time.elapsed_secs();
-    for (ent, mut h, mut tf) in hatching.iter_mut() {
-        h.t -= dt;
-        let urgency = ((3.0 - h.t.max(0.0)) / 3.0).clamp(0.0, 1.0);
+    let now = now_unix();
+    for (ent, h, mut tf) in hatching.iter_mut() {
+        let rem = (h.hatch_at - now) as f32;
+        // wobbles harder during the last ten seconds
+        let urgency = ((10.0 - rem.max(0.0)) / 10.0).clamp(0.0, 1.0);
         tf.rotation =
             Quat::from_rotation_z((t * 18.0).sin() * 0.14 * urgency) * Quat::from_rotation_y(t * 0.3);
-        if h.t <= 0.0 {
+        if rem <= 0.0 {
             let pos = tf.translation;
             let kind = h.kind;
             commands.entity(ent).despawn();
@@ -1784,51 +2817,15 @@ fn hatch_and_pets(
                     ShellBit { t: 12.0 },
                 ));
             }
-            // the pet hatches!
-            commands
-                .spawn((
-                    Transform::from_xyz(pos.x, 0.0, pos.z).with_scale(Vec3::splat(0.01)),
-                    Visibility::default(),
-                    Pet {
-                        phase: fastrand::f32() * TAU,
-                        age: 0.0,
-                    },
-                ))
-                .with_children(|p| {
-                    // body wears the same shell pattern as its egg
-                    p.spawn((
-                        Mesh3d(game.sphere_mesh.clone()),
-                        MeshMaterial3d(game.egg_mats[kind].clone()),
-                        Transform::from_xyz(0.0, 0.30, 0.0)
-                            .with_scale(Vec3::new(0.30, 0.26, 0.30)),
-                    ));
-                    p.spawn((
-                        Mesh3d(game.sphere_mesh.clone()),
-                        MeshMaterial3d(game.egg_mats[kind].clone()),
-                        Transform::from_xyz(0.0, 0.62, -0.06).with_scale(Vec3::splat(0.17)),
-                    ));
-                    for dx in [-0.07f32, 0.07] {
-                        p.spawn((
-                            Mesh3d(game.sphere_mesh.clone()),
-                            MeshMaterial3d(game.black_mat.clone()),
-                            Transform::from_xyz(dx, 0.66, -0.20).with_scale(Vec3::splat(0.035)),
-                        ));
-                    }
-                    p.spawn((
-                        Mesh3d(game.beak_mesh.clone()),
-                        MeshMaterial3d(game.beak_mat.clone()),
-                        Transform::from_xyz(0.0, 0.60, -0.24)
-                            .with_rotation(Quat::from_rotation_x(-PI / 2.0)),
-                    ));
-                });
+            // the egg pays out
+            let payout = hatch_payout(kind, game.level);
+            game.money += payout;
+            game.yard_eggs.push(kind);
+            let (_, rc) = rarity(kind);
+            game.msg = format!("+${} - your {} hatched!", fmt_money(payout), egg_name(kind));
+            game.msg_color = rc;
+            game.msg_t = 4.0;
         }
-    }
-    for (mut pet, mut tf) in pets.iter_mut() {
-        pet.age += dt;
-        let grow = (pet.age / 0.5).min(1.0);
-        tf.scale = Vec3::splat(grow.max(0.01));
-        tf.translation.y = (t * 5.0 + pet.phase).sin().abs() * 0.14 * grow;
-        tf.rotation = Quat::from_rotation_y((t * 0.6 + pet.phase).sin() * 1.2);
     }
     for (ent, mut b) in bits.iter_mut() {
         b.t -= dt;
@@ -1838,57 +2835,170 @@ fn hatch_and_pets(
     }
 }
 
+struct Theme {
+    safe: (f32, f32, f32),
+    zone: (f32, f32, f32),
+    zenith: (f32, f32, f32),
+    horizon: (f32, f32, f32),
+    visibility: f32,
+    lux: f32,
+    sun: (f32, f32, f32),
+    disc: (f32, f32, f32),
+    ambient: f32,
+}
+
+fn theme(level: usize, night: bool) -> Theme {
+    // (safe grass, egg-zone grass, sky zenith, horizon/fog, visibility, sun lux, sun colour, sun disc, ambient)
+    let rows: [(
+        (f32, f32, f32),
+        (f32, f32, f32),
+        (f32, f32, f32),
+        (f32, f32, f32),
+        f32,
+        f32,
+        (f32, f32, f32),
+        (f32, f32, f32),
+        f32,
+    ); N_WORLDS] = [
+        // 1 meadow
+        ((1.0, 1.0, 1.0), (0.80, 0.84, 0.78), (0.22, 0.44, 0.84), (0.70, 0.80, 0.92), 320.0, 11000.0, (1.0, 0.95, 0.86), (40.0, 36.0, 28.0), 320.0),
+        // 2 sunset
+        ((1.0, 0.86, 0.60), (0.95, 0.76, 0.50), (0.30, 0.32, 0.58), (0.96, 0.62, 0.38), 220.0, 7000.0, (1.0, 0.78, 0.55), (40.0, 16.0, 5.0), 220.0),
+        // 3 twilight
+        ((0.62, 0.55, 0.95), (0.50, 0.42, 0.88), (0.06, 0.05, 0.16), (0.20, 0.16, 0.36), 160.0, 3200.0, (0.70, 0.74, 1.0), (4.0, 4.4, 6.0), 170.0),
+        // 4 autumn
+        ((1.0, 0.72, 0.38), (0.92, 0.60, 0.32), (0.40, 0.42, 0.70), (0.95, 0.78, 0.55), 240.0, 8500.0, (1.0, 0.85, 0.65), (38.0, 26.0, 12.0), 260.0),
+        // 5 winter
+        ((1.0, 1.0, 1.0), (0.94, 0.97, 1.0), (0.55, 0.65, 0.80), (0.88, 0.92, 0.97), 180.0, 7000.0, (0.90, 0.95, 1.0), (30.0, 32.0, 36.0), 380.0),
+        // 6 jungle
+        ((0.55, 0.95, 0.55), (0.40, 0.80, 0.45), (0.10, 0.45, 0.50), (0.55, 0.85, 0.75), 140.0, 9000.0, (0.95, 1.0, 0.85), (36.0, 40.0, 26.0), 300.0),
+        // 7 desert
+        ((1.0, 0.92, 0.62), (0.98, 0.85, 0.55), (0.45, 0.62, 0.90), (0.98, 0.90, 0.70), 400.0, 13000.0, (1.0, 0.98, 0.88), (46.0, 42.0, 30.0), 340.0),
+        // 8 lava
+        ((0.75, 0.30, 0.20), (0.60, 0.20, 0.15), (0.15, 0.03, 0.03), (0.70, 0.18, 0.08), 120.0, 5000.0, (1.0, 0.55, 0.35), (40.0, 10.0, 3.0), 200.0),
+        // 9 alien ocean
+        ((0.45, 0.75, 1.0), (0.35, 0.60, 0.95), (0.05, 0.25, 0.45), (0.35, 0.85, 0.95), 200.0, 8000.0, (0.75, 0.95, 1.0), (20.0, 40.0, 44.0), 300.0),
+        // 10 hacker
+        ((0.30, 0.70, 0.35), (0.20, 0.55, 0.28), (0.01, 0.06, 0.02), (0.05, 0.30, 0.10), 150.0, 3600.0, (0.60, 1.0, 0.65), (6.0, 30.0, 8.0), 220.0),
+    ];
+    let r = rows[level.clamp(1, N_WORLDS) - 1];
+    let mut t = Theme {
+        safe: r.0,
+        zone: r.1,
+        zenith: r.2,
+        horizon: r.3,
+        visibility: r.4,
+        lux: r.5,
+        sun: r.6,
+        disc: r.7,
+        ambient: r.8,
+    };
+    if night {
+        t.zenith = (0.02, 0.02, 0.07);
+        t.horizon = (0.12, 0.10, 0.24);
+        t.visibility = 140.0;
+        t.lux = 2600.0;
+        t.sun = (0.70, 0.74, 1.0);
+        t.disc = (2.2, 2.4, 3.0);
+        t.ambient = 140.0;
+    }
+    t
+}
+
+const SUN_FROM: Vec3 = Vec3::new(60.0, 90.0, 150.0);
+const SUN_AT: Vec3 = Vec3::new(130.0, 0.0, 50.0);
+const SKY_RADIUS: f32 = 900.0;
+const SKY_CENTER: Vec3 = Vec3::new(WORLD_X / 2.0, 0.0, WORLD_Z / 2.0);
+
+fn sun_dir() -> Vec3 {
+    (SUN_AT - SUN_FROM).normalize()
+}
+
+fn fog_for(level: usize, night: bool) -> DistanceFog {
+    let t = theme(level, night);
+    let horizon = Color::srgb(t.horizon.0, t.horizon.1, t.horizon.2);
+    let glow = if night || matches!(level, 3 | 8 | 10) { 0.15 } else { 0.55 };
+    DistanceFog {
+        color: horizon,
+        directional_light_color: Color::srgba(t.sun.0, t.sun.1, t.sun.2, glow),
+        directional_light_exponent: 24.0,
+        falloff: FogFalloff::from_visibility_colors(
+            t.visibility,
+            Color::srgb(0.35, 0.5, 0.66),
+            horizon,
+        ),
+    }
+}
+
+// Vertex-coloured gradient dome: horizon colour at the rim, zenith colour overhead.
+fn set_sky_colors(mesh: &mut Mesh, level: usize, night: bool) {
+    let t = theme(level, night);
+    let zen = Color::srgb(t.zenith.0, t.zenith.1, t.zenith.2).to_linear();
+    let hor = Color::srgb(t.horizon.0, t.horizon.1, t.horizon.2).to_linear();
+    let Some(VertexAttributeValues::Float32x3(pos)) = mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+    else {
+        return;
+    };
+    let colors: Vec<[f32; 4]> = pos
+        .iter()
+        .map(|p| {
+            let h = (p[1] / SKY_RADIUS).clamp(-1.0, 1.0);
+            let k = if h > 0.0 { h.powf(0.6) } else { 0.0 };
+            let d = if h < 0.0 { 1.0 + h * 0.5 } else { 1.0 };
+            [
+                (hor.red + (zen.red - hor.red) * k) * d,
+                (hor.green + (zen.green - hor.green) * k) * d,
+                (hor.blue + (zen.blue - hor.blue) * k) * d,
+                1.0,
+            ]
+        })
+        .collect();
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+}
+
+fn sky_dome_mesh(level: usize, night: bool) -> Mesh {
+    let mut mesh = Mesh::from(Sphere::new(SKY_RADIUS).mesh().uv(48, 24));
+    set_sky_colors(&mut mesh, level, night);
+    mesh
+}
+
 fn apply_level_theme(
     level: usize,
+    night: bool,
     game: &Game,
     materials: &mut Assets<StandardMaterial>,
+    meshes: &mut Assets<Mesh>,
     clear: &mut ClearColor,
+    ambient: &mut AmbientLight,
     fog_q: &mut Query<&mut DistanceFog>,
     sun_q: &mut Query<&mut DirectionalLight>,
 ) {
-    let (safe, zone, sky, fog, lux, sun) = match level {
-        1 => (
-            (1.0, 1.0, 1.0),
-            (0.78, 0.82, 0.78),
-            (0.54, 0.74, 0.94),
-            (0.6, 0.75, 0.92),
-            9500.0,
-            (1.0, 0.96, 0.88),
-        ),
-        2 => (
-            (1.0, 0.86, 0.58),
-            (0.95, 0.76, 0.48),
-            (0.93, 0.66, 0.40),
-            (0.92, 0.70, 0.50),
-            7500.0,
-            (1.0, 0.82, 0.60),
-        ),
-        _ => (
-            (0.62, 0.52, 1.0),
-            (0.50, 0.40, 0.92),
-            (0.08, 0.05, 0.20),
-            (0.16, 0.11, 0.30),
-            3200.0,
-            (0.72, 0.72, 1.0),
-        ),
-    };
+    let t = theme(level, night);
     if let Some(m) = materials.get_mut(&game.safe_grass_mat) {
-        m.base_color = Color::srgb(safe.0, safe.1, safe.2);
+        m.base_color = Color::srgb(t.safe.0, t.safe.1, t.safe.2);
     }
     if let Some(m) = materials.get_mut(&game.zone_grass_mat) {
-        m.base_color = Color::srgb(zone.0, zone.1, zone.2);
+        m.base_color = Color::srgb(t.zone.0, t.zone.1, t.zone.2);
     }
-    clear.0 = Color::srgb(sky.0, sky.1, sky.2);
+    if let Some(m) = materials.get_mut(&game.sun_mat) {
+        m.emissive = LinearRgba::rgb(t.disc.0, t.disc.1, t.disc.2);
+    }
+    if let Some(mesh) = meshes.get_mut(&game.sky_mesh) {
+        set_sky_colors(mesh, level, night);
+    }
+    clear.0 = Color::srgb(t.horizon.0, t.horizon.1, t.horizon.2);
+    ambient.brightness = t.ambient;
     for mut f in fog_q.iter_mut() {
-        f.color = Color::srgb(fog.0, fog.1, fog.2);
+        *f = fog_for(level, night);
     }
     for mut s in sun_q.iter_mut() {
-        s.illuminance = lux;
-        s.color = Color::srgb(sun.0, sun.1, sun.2);
+        s.illuminance = t.lux;
+        s.color = Color::srgb(t.sun.0, t.sun.1, t.sun.2);
     }
 }
 
 fn portal_system(
+    keys: Res<ButtonInput<KeyCode>>,
     mut game: ResMut<Game>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     player_q: Query<&Transform, With<Player>>,
@@ -1899,12 +3009,11 @@ fn portal_system(
     // glow when the next world is affordable; gold once you are EGG MASTER
     let lit = if game.won {
         true
-    } else if !game.unlocked[1] {
-        game.money >= LEVEL_COST[0]
-    } else if !game.unlocked[2] {
-        game.money >= LEVEL_COST[1]
     } else {
-        true
+        match next_locked(&game.unlocked) {
+            Some(w) => game.money >= LEVEL_COST[w - 2],
+            None => true,
+        }
     };
     if lit != game.portal_lit {
         game.portal_lit = lit;
@@ -1918,22 +3027,25 @@ fn portal_system(
             };
         }
     }
-    // beat World 3 by reaching $3000000 there
-    if game.level == 3 && !game.won && game.money >= LEVEL_COST[2] {
+    // beat the game by reaching WIN_MONEY in the last world
+    if game.level == N_WORLDS && !game.won && game.money >= WIN_MONEY {
         game.won = true;
         if let Some(m) = materials.get_mut(&game.portal_mat) {
             m.emissive = LinearRgba::rgb(3.0, 2.4, 0.6);
         }
-        game.msg = "$3000000 IN WORLD 3 - YOU BEAT THE GAME! EGG MASTER!".to_string();
+        game.msg = format!(
+            "${} IN WORLD {} - YOU BEAT THE GAME! EGG MASTER!",
+            fmt_money(WIN_MONEY),
+            N_WORLDS
+        );
         game.msg_color = Color::srgb(1.0, 0.85, 0.2);
         game.msg_t = 12.0;
     }
-    // stepping into the portal opens the world-select bar
+    // press E at any yard's portal to open the world-select bar; walking away closes it
     let p = ptf.translation;
-    let d = Vec2::new(p.x - PORTAL_POS.x, p.z - PORTAL_POS.z).length();
-    if d < 1.7 && !game.menu_open {
+    if near_portal(p) && keys.just_pressed(KeyCode::KeyE) && !game.menu_open {
         game.menu_open = true;
-    } else if d > 3.5 && game.menu_open {
+    } else if game.menu_open && !near_portal(p) {
         game.menu_open = false;
     }
 }
@@ -1973,7 +3085,9 @@ fn portal_menu(
 fn world_buttons(
     mut game: ResMut<Game>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut clear: ResMut<ClearColor>,
+    mut ambient: ResMut<AmbientLight>,
     mut player_q: Query<&mut Transform, With<Player>>,
     mut fog_q: Query<&mut DistanceFog>,
     mut sun_q: Query<&mut DirectionalLight>,
@@ -1991,7 +3105,7 @@ fn world_buttons(
                 format!("World {}", w)
             }
         } else {
-            format!("World {} - ${}", w, LEVEL_COST[w - 2] as u64)
+            format!("World {} - ${}", w, fmt_money(LEVEL_COST[w - 2]))
         };
         if text.0 != s {
             text.0 = s;
@@ -2024,8 +3138,8 @@ fn world_buttons(
                     game.msg = format!("Welcome back to World {}!", w);
                     game.msg_color = Color::srgb(0.5, 1.0, 1.0);
                     game.msg_t = 4.0;
-                } else if w == 3 && !game.unlocked[1] {
-                    game.msg = "Unlock World 2 first!".to_string();
+                } else if w > 2 && !game.unlocked[w - 2] {
+                    game.msg = format!("Unlock World {} first!", w - 1);
                     game.msg_color = Color::srgb(1.0, 0.5, 0.5);
                     game.msg_t = 2.5;
                 } else {
@@ -2037,14 +3151,16 @@ fn world_buttons(
                         game.msg = format!(
                             "WORLD {} UNLOCKED! Eggs are worth {}x here!",
                             w,
-                            level_mult(w) as u64
+                            fmt_money(level_mult(w))
                         );
                         game.msg_color = Color::srgb(0.5, 1.0, 1.0);
                         game.msg_t = 6.0;
                     } else {
                         game.msg = format!(
                             "World {} needs ${} (you have ${})",
-                            w, cost as u64, game.money as u64
+                            w,
+                            fmt_money(cost),
+                            fmt_money(game.money)
                         );
                         game.msg_color = Color::srgb(1.0, 0.5, 0.5);
                         game.msg_t = 2.5;
@@ -2057,7 +3173,17 @@ fn world_buttons(
     }
     if let Some(w) = travel_to {
         game.level = w;
-        apply_level_theme(w, &game, &mut materials, &mut clear, &mut fog_q, &mut sun_q);
+        apply_level_theme(
+            w,
+            game.night,
+            &game,
+            &mut materials,
+            &mut meshes,
+            &mut clear,
+            &mut ambient,
+            &mut fog_q,
+            &mut sun_q,
+        );
         if let Ok(mut ptf) = player_q.single_mut() {
             ptf.translation = SPAWN;
         }
@@ -2065,23 +3191,237 @@ fn world_buttons(
     }
 }
 
+fn day_night(
+    mut game: ResMut<Game>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut clear: ResMut<ClearColor>,
+    mut ambient: ResMut<AmbientLight>,
+    mut fog_q: Query<&mut DistanceFog>,
+    mut sun_q: Query<&mut DirectionalLight>,
+    mut wall_q: Query<&mut Visibility, With<NightWall>>,
+) {
+    let night = is_night_at(now_unix());
+    if game.night_applied == Some(night) {
+        return;
+    }
+    let first = game.night_applied.is_none();
+    game.night = night;
+    game.night_applied = Some(night);
+    apply_level_theme(
+        game.level,
+        night,
+        &game,
+        &mut materials,
+        &mut meshes,
+        &mut clear,
+        &mut ambient,
+        &mut fog_q,
+        &mut sun_q,
+    );
+    for mut v in wall_q.iter_mut() {
+        *v = if night {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+    if !first {
+        if night {
+            game.msg = "NIGHT HAS FALLEN! The monsters are awake and the line is sealed until morning."
+                .to_string();
+            game.msg_color = Color::srgb(1.0, 0.3, 0.3);
+        } else {
+            game.msg = "GOOD MORNING! The line is open again - go steal some eggs!".to_string();
+            game.msg_color = Color::srgb(1.0, 0.9, 0.4);
+        }
+        game.msg_t = 6.0;
+    }
+}
+
+// buy gear with [E] at the Gear Station, use it with F / G / H
+fn gear_system(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut game: ResMut<Game>,
+    player_q: Query<&Transform, With<Player>>,
+    mut monsters: Query<(&mut Monster, &Transform), Without<Player>>,
+) {
+    let dt = time.delta_secs();
+    for cd in game.gear_cd.iter_mut() {
+        *cd = (*cd - dt).max(0.0);
+    }
+    let Ok(ptf) = player_q.single() else {
+        return;
+    };
+    let p = ptf.translation;
+    if keys.just_pressed(KeyCode::KeyE) && near_gear(p) && game.gear < 3 {
+        let i = game.gear;
+        if game.money >= GEAR_COSTS[i] {
+            game.money -= GEAR_COSTS[i];
+            game.gear += 1;
+            game.msg = format!(
+                "{} bought! Press [{}] to freeze {} for {} s.",
+                GEAR_NAMES[i],
+                GEAR_KEY_NAMES[i],
+                match i {
+                    0 => "the nearest monster",
+                    1 => "every monster near you",
+                    _ => "every monster in the world",
+                },
+                GEAR_FREEZE[i] as u32
+            );
+            game.msg_color = Color::srgb(0.6, 0.9, 1.0);
+        } else {
+            game.msg = format!("Need ${} for the {}!", GEAR_COSTS[i] as u64, GEAR_NAMES[i]);
+            game.msg_color = Color::srgb(1.0, 0.4, 0.4);
+        }
+        game.msg_t = 3.0;
+    }
+    for i in 0..3 {
+        if i >= game.gear || !keys.just_pressed(GEAR_KEYS[i]) {
+            continue;
+        }
+        if game.gear_cd[i] > 0.0 {
+            game.msg = format!("{} recharging: {:.0} s", GEAR_NAMES[i], game.gear_cd[i]);
+            game.msg_color = Color::srgb(0.7, 0.8, 1.0);
+            game.msg_t = 1.5;
+            continue;
+        }
+        let mut hit = 0;
+        if i == 0 {
+            // freeze gun: the nearest monster in range
+            let mut best: Option<(f32, Mut<Monster>)> = None;
+            for (m, tf) in monsters.iter_mut() {
+                let d = (tf.translation - p).xz().length();
+                if d < GEAR_RANGE[0] && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                    best = Some((d, m));
+                }
+            }
+            if let Some((_, mut m)) = best {
+                m.frozen = m.frozen.max(GEAR_FREEZE[0]);
+                hit = 1;
+            }
+        } else {
+            for (mut m, tf) in monsters.iter_mut() {
+                if (tf.translation - p).xz().length() < GEAR_RANGE[i] {
+                    m.frozen = m.frozen.max(GEAR_FREEZE[i]);
+                    hit += 1;
+                }
+            }
+        }
+        if hit > 0 {
+            game.gear_cd[i] = GEAR_COOLDOWN[i];
+            game.msg = format!(
+                "{}: froze {} monster{} for {} s!",
+                GEAR_NAMES[i],
+                hit,
+                if hit == 1 { "" } else { "s" },
+                GEAR_FREEZE[i] as u32
+            );
+            game.msg_color = Color::srgb(0.6, 0.9, 1.0);
+        } else {
+            game.msg = format!("{}: no monster in range!", GEAR_NAMES[i]);
+            game.msg_color = Color::srgb(1.0, 0.6, 0.4);
+        }
+        game.msg_t = 2.5;
+    }
+}
+
+// autosave every 15 s and on exit
+fn save_system(
+    time: Res<Time>,
+    game: Res<Game>,
+    hatching: Query<&Hatching>,
+    mut exit: EventReader<AppExit>,
+    mut timer: Local<f32>,
+) {
+    *timer += time.delta_secs();
+    let exiting = exit.read().next().is_some();
+    if !exiting && *timer < 15.0 {
+        return;
+    }
+    *timer = 0.0;
+    let data = SaveData {
+        money: game.money,
+        training: game.training,
+        tier: game.tier,
+        level: game.level,
+        unlocked: game.unlocked.to_vec(),
+        won: game.won,
+        inventory: game.inventory.to_vec(),
+        gear: game.gear,
+        yard_eggs: game.yard_eggs.clone(),
+        hatching: hatching.iter().map(|h| (h.kind, h.slot, h.hatch_at)).collect(),
+    };
+    if let Ok(text) = serde_json::to_string(&data) {
+        if let Err(e) = std::fs::write(save_path(), text) {
+            warn!("could not save game: {e}");
+        }
+    }
+}
+
 fn hud(
     game: Res<Game>,
+    player_q: Query<&Transform, With<Player>>,
+    hatching_q: Query<&Hatching>,
     mut q: Query<(&mut Text, &mut TextColor, &Hud), Without<SlotText>>,
-    mut slots: Query<(&mut BackgroundColor, &SlotUi)>,
+    mut slots: Query<(&mut BackgroundColor, &mut BorderColor, &SlotUi)>,
     mut slot_texts: Query<(&mut Text, &mut TextColor, &SlotText), Without<Hud>>,
 ) {
-    let income: f64 = game.yard_eggs.iter().map(|&k| egg_value(k) * 1.5).sum::<f64>()
-        * level_mult(game.level);
+    let p = player_q.single().map(|t| t.translation).unwrap_or(SPAWN);
+    let now = now_unix();
     for (mut text, mut color, hud) in q.iter_mut() {
         match hud {
+            Hud::Clock => {
+                let phase = if game.night {
+                    format!("NIGHT - morning in {}", fmt_dur(phase_left(now)))
+                } else {
+                    format!("DAY - night in {}", fmt_dur(phase_left(now)))
+                };
+                let n = hatching_q.iter().count();
+                let hatch = if n == 0 {
+                    "Hatching: none".to_string()
+                } else {
+                    let next = hatching_q
+                        .iter()
+                        .map(|h| h.hatch_at - now)
+                        .fold(f64::MAX, f64::min);
+                    format!("Hatching: {} (next in {})", n, fmt_dur(next))
+                };
+                text.0 = format!("{}   |   {}", phase, hatch);
+                color.0 = if game.night {
+                    Color::srgb(1.0, 0.55, 0.55)
+                } else {
+                    Color::srgb(0.9, 0.9, 0.75)
+                };
+            }
+            Hud::Gear => {
+                text.0 = if game.gear == 0 {
+                    "Gear: none - buy some at the Gear Station beside your yard".to_string()
+                } else {
+                    let parts: Vec<String> = (0..game.gear)
+                        .map(|i| {
+                            if game.gear_cd[i] > 0.0 {
+                                format!("[{}] {} {:.0}s", GEAR_KEY_NAMES[i], GEAR_NAMES[i], game.gear_cd[i])
+                            } else {
+                                format!("[{}] {} READY", GEAR_KEY_NAMES[i], GEAR_NAMES[i])
+                            }
+                        })
+                        .collect();
+                    format!("Gear: {}", parts.join("   "))
+                };
+            }
+            Hud::Night => {
+                if game.night && p.x > LINE_X - 30.0 && p.x < LINE_X + 2.0 {
+                    text.0 = "IT IS NIGHT TIME. You cannot go out there.".to_string();
+                    color.0 = Color::srgb(1.0, 0.2, 0.2);
+                } else {
+                    text.0.clear();
+                }
+            }
             Hud::Money => {
-                text.0 = format!(
-                    "$ {}   (+${}/s)   WORLD {}",
-                    game.money.floor() as i64,
-                    income as u64,
-                    game.level
-                );
+                text.0 = format!("$ {}   WORLD {}", fmt_money(game.money), game.level);
             }
             Hud::Speed => {
                 let kmh = player_speed(&game) * 3.6;
@@ -2095,85 +3435,93 @@ fn hud(
                     game.yard_eggs.iter().copied().collect();
                 let portal = if game.won {
                     "EGG MASTER!".to_string()
-                } else if !game.unlocked[1] {
-                    format!("World 2: ${}", LEVEL_COST[0] as u64)
-                } else if !game.unlocked[2] {
-                    format!("World 3: ${}", LEVEL_COST[1] as u64)
                 } else {
-                    format!("Win: ${} in World 3", LEVEL_COST[2] as u64)
+                    match next_locked(&game.unlocked) {
+                        Some(w) => format!("World {}: ${}", w, fmt_money(LEVEL_COST[w - 2])),
+                        None => format!("Win: ${} in World {}", fmt_money(WIN_MONEY), N_WORLDS),
+                    }
                 };
                 text.0 = format!(
-                    "Pets: {}   Types: {}/169   {}",
+                    "Hatched: {}   Types: {}/169   {}",
                     game.yard_eggs.len(),
                     types.len(),
                     portal
                 );
             }
             Hud::Carry => {
-                if game.inventory.is_empty() {
+                if !game.has_eggs() {
                     text.0.clear();
                 } else {
-                    let total: f64 = game.inventory.iter().map(|&k| egg_value(k)).sum();
-                    let best = game
-                        .inventory
-                        .iter()
-                        .copied()
-                        .max_by_key(|&k| egg_value(k) as u64)
-                        .unwrap();
+                    let total: f64 = game.carried().map(egg_value).sum();
+                    let best = game.carried().max_by_key(|&k| egg_value(k) as u64).unwrap();
                     let (_, rc) = rarity(best);
                     text.0 = format!(
-                        "Carrying {}/5 eggs (worth ${}) - take them to YOUR YARD to hatch!",
-                        game.inventory.len(),
+                        "Carrying {}/{} eggs (worth ${}) - take them to YOUR YARD to hatch!",
+                        game.carrying(),
+                        INV_SLOTS,
                         total as u64
                     );
                     color.0 = rc;
                 }
             }
             Hud::Msg => {
-                if game.msg_t > 0.0 {
+                if game.paused {
+                    text.0.clear();
+                } else if game.msg_t > 0.0 {
                     text.0 = game.msg.clone();
                     color.0 = game.msg_color.with_alpha(game.msg_t.min(1.0));
                 } else if game.won {
-                    text.0 = "EGG MASTER! All 3 levels complete!".to_string();
+                    text.0 = "EGG MASTER! All 10 worlds complete!".to_string();
                     color.0 = Color::srgb(1.0, 0.85, 0.2);
                 } else {
                     text.0.clear();
                 }
             }
             Hud::Prompt => {
-                let next_cost = if !game.unlocked[1] {
-                    Some(LEVEL_COST[0])
-                } else if !game.unlocked[2] {
-                    Some(LEVEL_COST[1])
-                } else {
-                    None
-                };
+                let next_cost = next_locked(&game.unlocked).map(|w| LEVEL_COST[w - 2]);
                 text.0 = if game.menu_open {
                     "Click a world to travel! (Esc or walk away to close)".to_string()
+                } else if near_portal(p) {
+                    "[E] open the portal and pick a world".to_string()
+                } else if near_gear(p) {
+                    if game.gear < 3 {
+                        format!(
+                            "GEAR STATION / UPGRADER - [E] buy {} (${})",
+                            GEAR_NAMES[game.gear],
+                            GEAR_COSTS[game.gear] as u64
+                        )
+                    } else {
+                        "GEAR STATION / UPGRADER - you own every piece of gear!".to_string()
+                    }
                 } else if next_cost.is_some_and(|c| game.money >= c) {
-                    "THE PORTAL IS GLOWING! Walk into it at the back of YOUR YARD!".to_string()
+                    "THE PORTALS ARE GLOWING! Press [E] at the one at the back of any yard!".to_string()
                 } else if game.tier < 6 {
                     format!(
-                        "WASD move | mouse look | click to capture mouse | [E] near treadmill: upgrade to {} (${})",
+                        "WASD move | mouse look | 1-0 select slot | [E] near treadmill: upgrade to {} (${})",
                         T_NAMES[game.tier + 1],
                         T_COSTS[game.tier + 1] as u64
                     )
                 } else {
-                    "WASD move | mouse look | HACKER treadmill maxed - run forever!".to_string()
+                    "WASD move | mouse look | 1-0 select slot | HACKER treadmill maxed - run forever!".to_string()
                 };
             }
         }
     }
-    for (mut bg, slot) in slots.iter_mut() {
-        if let Some(&k) = game.inventory.get(slot.0) {
+    for (mut bg, mut border, slot) in slots.iter_mut() {
+        if let Some(k) = game.inventory[slot.0] {
             let (r, g, b) = EGG_RGB[k / 13];
             bg.0 = Color::srgb(r, g, b);
         } else {
             bg.0 = Color::srgba(0.0, 0.0, 0.0, 0.45);
         }
+        border.0 = if slot.0 == game.selected {
+            Color::srgb(1.0, 0.9, 0.3)
+        } else {
+            Color::srgba(1.0, 1.0, 1.0, 0.55)
+        };
     }
     for (mut text, mut tc, st) in slot_texts.iter_mut() {
-        if let Some(&k) = game.inventory.get(st.0) {
+        if let Some(k) = game.inventory[st.0] {
             let (r, g, b) = EGG_RGB[k / 13];
             text.0 = format!("${}", egg_value(k) as u64);
             tc.0 = if r * 0.3 + g * 0.6 + b * 0.1 > 0.5 {
@@ -2182,7 +3530,63 @@ fn hud(
                 Color::WHITE
             };
         } else {
-            text.0.clear();
+            // empty slot: show its key
+            text.0 = ((st.0 + 1) % 10).to_string();
+            tc.0 = Color::srgba(1.0, 1.0, 1.0, 0.35);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk(from: Vec3, to: Vec3) -> Vec3 {
+        let mut p = from;
+        move_blocked(&mut p, to - from, &blockers());
+        p
+    }
+
+    #[test]
+    fn fence_blocks_walking_through_rails() {
+        // approach the east fence of yard 0 away from the gate
+        let end = walk(Vec3::new(45.0, EYE, 15.0), Vec3::new(41.0, EYE, 15.0));
+        assert!(end.x >= YARD.1 + FENCE_HALF + PLAYER_RADIUS - 1e-3, "went through fence: {end}");
+        // and from the inside going out
+        let end = walk(Vec3::new(41.0, EYE, 30.0), Vec3::new(45.0, EYE, 30.0));
+        assert!(end.x <= YARD.1 - FENCE_HALF - PLAYER_RADIUS + 1e-3, "went through fence: {end}");
+        // north fence too
+        let end = walk(Vec3::new(30.0, EYE, 9.0), Vec3::new(30.0, EYE, 15.0));
+        assert!(end.z <= YARD.2 - FENCE_HALF - PLAYER_RADIUS + 1e-3, "went through fence: {end}");
+    }
+
+    #[test]
+    fn gate_lets_you_in() {
+        let end = walk(Vec3::new(44.5, EYE, 24.5), Vec3::new(41.0, EYE, 24.5));
+        assert!((end.x - 41.0).abs() < 1e-3, "gate blocked: {end}");
+    }
+
+    #[test]
+    fn treadmill_open_from_east_but_solid_on_sides_and_console() {
+        // step on from the east end and reach the middle of the belt
+        let end = walk(Vec3::new(51.0, EYE, TM_CENTER.z), TM_CENTER.with_y(EYE));
+        assert!((end - TM_CENTER.with_y(EYE)).length() < 1e-3, "could not step on: {end}");
+        assert!(on_deck(end));
+        // cannot walk out through the console at the west end
+        let end = walk(TM_CENTER.with_y(EYE), Vec3::new(45.0, EYE, TM_CENTER.z));
+        assert!(end.x > TM_CENTER.x - TM_BELT_L / 2.0 - 0.05, "went through console: {end}");
+        // cannot walk in through the side frame
+        let end = walk(Vec3::new(TM_CENTER.x, EYE, 22.0), TM_CENTER.with_y(EYE));
+        assert!(end.z < TM_CENTER.z - TM_BELT_W / 2.0, "went through side frame: {end}");
+    }
+
+    #[test]
+    fn fast_movement_cannot_tunnel() {
+        // one huge step straight through the fence still gets pushed out
+        let b = blockers();
+        let mut p = Vec3::new(43.2, EYE, 15.0);
+        p.x = 42.9; // now inside the rail box
+        resolve_blockers(&mut p, PLAYER_RADIUS, &b);
+        assert!((p.x - YARD.1).abs() >= FENCE_HALF + PLAYER_RADIUS - 1e-3, "{p}");
     }
 }
