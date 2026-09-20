@@ -66,7 +66,7 @@ const INV_SLOTS: usize = 10;
 
 // day/night cycle on the wall clock, so it keeps running while the game is closed
 const DAY_SECS: f64 = 30.0 * 60.0;
-const NIGHT_SECS: f64 = 10.0 * 60.0;
+const NIGHT_SECS: f64 = 5.0 * 60.0;
 // hatch times: a plain white egg takes 5 minutes, a Hacker Rainbow egg an hour
 const HATCH_MIN_SECS: f64 = 5.0 * 60.0;
 const HATCH_MAX_SECS: f64 = 60.0 * 60.0;
@@ -2354,12 +2354,24 @@ fn player_look(
     tf.rotation = Quat::from_euler(EulerRot::YXZ, pl.yaw, pl.pitch, 0.0);
 }
 
-fn player_speed(game: &Game) -> f32 {
+// inside the safe zone you always move at exactly this speed
+const SAFE_SPEED_KMH: f32 = 27.3;
+
+// how fast training has made you (used past the line and for the belt)
+fn trained_speed(game: &Game) -> f32 {
     let mut s = 4.2 + game.training * 0.06;
     if game.has_eggs() {
         s *= 0.92;
     }
     s
+}
+
+fn player_speed(game: &Game, p: Vec3) -> f32 {
+    if p.x < LINE_X {
+        SAFE_SPEED_KMH / 3.6
+    } else {
+        trained_speed(game)
+    }
 }
 
 fn player_move(
@@ -2389,7 +2401,7 @@ fn player_move(
     }
     let moving = dir.length_squared() > 0.0;
     let delta = if moving {
-        dir.normalize() * player_speed(&game) * dt
+        dir.normalize() * player_speed(&game, tf.translation) * dt
     } else {
         Vec3::ZERO
     };
@@ -2417,7 +2429,7 @@ fn player_move(
     let t = time.elapsed_secs();
     tf.translation.y = game.eye_h
         + if moving {
-            (t * (5.0 + player_speed(&game) * 0.6)).sin() * 0.035
+            (t * (5.0 + player_speed(&game, tf.translation) * 0.6)).sin() * 0.035
         } else {
             0.0
         };
@@ -2765,7 +2777,7 @@ fn animate(
     let dt = time.delta_secs();
     // belt scroll
     let belt_speed = if game.on_treadmill {
-        0.6 + player_speed(&game) * 0.25
+        0.6 + trained_speed(&game) * 0.25
     } else {
         0.35
     };
@@ -3424,10 +3436,15 @@ fn hud(
                 text.0 = format!("$ {}   WORLD {}", fmt_money(game.money), game.level);
             }
             Hud::Speed => {
-                let kmh = player_speed(&game) * 3.6;
+                let kmh = player_speed(&game, p) * 3.6;
+                let zone = if p.x < LINE_X {
+                    format!(" (egg zone: {:.1})", trained_speed(&game) * 3.6)
+                } else {
+                    String::new()
+                };
                 text.0 = format!(
-                    "Speed: {:.1} km/h   Training: {:.0}   Treadmill: {}",
-                    kmh, game.training, T_NAMES[game.tier]
+                    "Speed: {:.1} km/h{}   Training: {:.0}   Treadmill: {}",
+                    kmh, zone, game.training, T_NAMES[game.tier]
                 );
             }
             Hud::Stats => {
